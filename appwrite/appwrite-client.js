@@ -1,13 +1,18 @@
 /**
  * appwrite/appwrite-client.js
  *
- * Appwrite integration module for the Discord bot.
+ * Bot-only Appwrite integration module for the Discord bot.
+ *
+ * Uses APPWRITE_BOT_DB_ID (with APPWRITE_DB_ID as backward-compat fallback).
  *
  * Provides:
  *   - Lazy-initialized Appwrite SDK client
  *   - syncDB(db)  – write current in-memory db to Appwrite (all collections)
  *   - loadDB()    – read all collections from Appwrite; returns partial db object
  *   - Per-collection helpers for more granular reads/writes
+ *
+ * This module ONLY writes to the bot database.
+ * For website data (read-only), use appwrite-website-reader.js.
  *
  * All functions are designed to fail gracefully: errors are logged with
  * console.warn and the caller receives null / undefined so the bot can
@@ -295,6 +300,8 @@ export async function syncDB(db) {
       syncMapCollection(COLLECTION_IDS.archivedAds, db.archivedAds),
       syncSingleDoc(COLLECTION_IDS.defaultEmbedColor, 'config', db.defaultEmbedColor),
       syncSingleDoc(COLLECTION_IDS.sticky,        'config', db.sticky),
+      syncSingleDoc(COLLECTION_IDS.aiChannel,     'config', db.aiChannelId),
+      syncSingleDoc(COLLECTION_IDS.keywords,      'all',    db.keywordAutomations),
 
       // Map / per-entity collections
       syncMapCollection(COLLECTION_IDS.tutorProfiles,      db.tutorProfiles),
@@ -309,9 +316,9 @@ export async function syncDB(db) {
       // Array collections
       syncArrayCollection(COLLECTION_IDS.pendingReviews, db.pendingReviews),
     ]);
-    console.log('[Appwrite] DB synced successfully.');
+    console.log('[BotDB] DB synced successfully.');
   } catch (e) {
-    console.warn('[Appwrite] syncDB encountered an error:', e.message);
+    console.warn('[BotDB] syncDB encountered an error:', e.message);
   }
 }
 
@@ -337,6 +344,8 @@ export async function loadDB() {
       archivedAds,
       defaultEmbedColor,
       sticky,
+      aiChannelId,
+      keywordAutomations,
       tutorProfiles,
       studentAssignments,
       pendingReviews,
@@ -359,6 +368,8 @@ export async function loadDB() {
       loadMapCollection(COLLECTION_IDS.archivedAds),
       loadSingleDoc(COLLECTION_IDS.defaultEmbedColor, 'config'),
       loadSingleDoc(COLLECTION_IDS.sticky,        'config'),
+      loadSingleDoc(COLLECTION_IDS.aiChannel,     'config'),
+      loadSingleDoc(COLLECTION_IDS.keywords,      'all'),
       loadMapCollection(COLLECTION_IDS.tutorProfiles),
       loadMapCollection(COLLECTION_IDS.studentAssignments),
       loadArrayCollection(COLLECTION_IDS.pendingReviews),
@@ -385,6 +396,8 @@ export async function loadDB() {
     if (archivedAds   && Object.keys(archivedAds).length) result.archivedAds = archivedAds;
     if (defaultEmbedColor !== null) result.defaultEmbedColor = defaultEmbedColor;
     if (sticky        !== null) result.sticky        = sticky;
+    if (aiChannelId   !== null) result.aiChannelId   = aiChannelId;
+    if (keywordAutomations !== null) result.keywordAutomations = keywordAutomations;
 
     if (tutorProfiles      && Object.keys(tutorProfiles).length)      result.tutorProfiles      = tutorProfiles;
     if (studentAssignments && Object.keys(studentAssignments).length) result.studentAssignments = studentAssignments;
@@ -399,7 +412,7 @@ export async function loadDB() {
     // Return null if we got nothing useful from Appwrite
     return Object.keys(result).length > 0 ? result : null;
   } catch (e) {
-    console.warn('[Appwrite] loadDB failed:', e.message);
+    console.warn('[BotDB] loadDB failed:', e.message);
     return null;
   }
 }

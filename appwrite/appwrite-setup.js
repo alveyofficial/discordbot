@@ -532,6 +532,26 @@ const COLLECTIONS = [
   },
 
   {
+    id: COLLECTION_IDS.aiChannel,
+    name: 'Discord AI Channel',
+    permissions: SERVER_ONLY_PERMS,
+    // Single document (id="config"): channel ID string | null
+    attrs: async (cid) => {
+      await createLongtextAttr(cid, 'data', true);
+    },
+  },
+
+  {
+    id: COLLECTION_IDS.keywords,
+    name: 'Discord Keywords',
+    permissions: SERVER_ONLY_PERMS,
+    // Single document (id="all"): keyword automation array
+    attrs: async (cid) => {
+      await createLongtextAttr(cid, 'data', true);
+    },
+  },
+
+  {
     id: COLLECTION_IDS.tickets,
     name: 'Discord Tickets',
     permissions: SERVER_ONLY_PERMS,

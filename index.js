@@ -18,8 +18,8 @@ import 'newrelic';
 import fs from 'fs';
 import { runStartupPreflight } from './startup-check.js';
 import dotenv from 'dotenv';
-runStartupPreflight();
 dotenv.config();
+runStartupPreflight();
 
 import * as appwriteClient from './appwrite/appwrite-client.js';
 
@@ -73,6 +73,7 @@ app.listen(PORT, () => {
 
 import initModmail from './modmail.js';
 import initDemo from './demo.js';
+import initAIAssistant from './ai-assistant.js';
 
 
 // env
@@ -94,6 +95,7 @@ const {
   BUMP_CHANNEL_ID, // Optional: Channel ID where bump tracking should listen (if not set, listens in all channels)
   ADS_CHANNEL_ID,
   ARCHIVED_ADS_CHANNEL_ID,
+  AI_CHANNEL_ID,
   SYNC_SECRET,
   SYNC_WEBHOOK_URL
 } = process.env;
@@ -153,6 +155,7 @@ let db = {
   subjectTutors: { 'IGCSE Maths': ['742420325559435375', '873095080938975232'] }, // tutor user ids
   initMessage: 'Hello, thanks for requesting a tutor for **{subject}**. Please tell us your topic, availability, timezone. Do not post contact info.',
   keywordAutomations: [],
+  aiChannelId: null,
   tickets: {},
   cooldowns: {},
   sticky: null, // { title, body, color, messageId }
@@ -418,6 +421,90 @@ function findOpenTicketForUserSubject(userId, subject) {
     if (ticketKey && ticketKey === targetKey) return { code, ticket };
   }
   return null;
+}
+
+async function createEnquiryTicketFromInteraction(interaction, { subject, selectedTutorId = null, source = 'enquire', creatingMessage = 'Creating your ticket...', successVerb = 'Continue in' } = {}) {
+  const user = interaction.user;
+  const guild = interaction.guild;
+  if (!guild || !user) {
+    if (!interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: 'Tickets can only be created inside the server.', ephemeral: true }).catch(() => {});
+    }
+    return null;
+  }
+
+  const safeSubject = String(subject || '').trim() || 'Tutoring enquiry';
+  const existing = findOpenTicketForUserSubject(user.id, safeSubject);
+  if (existing) {
+    const existingChannel = await guild.channels.fetch(existing.ticket.ticketChannelId).catch(() => null);
+    const where = existingChannel ? ` in <#${existingChannel.id}>` : '';
+    const content = `You already have an open ticket for **${existing.ticket.subject}**${where}. Please close it before opening another.`;
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content }).catch(() => {});
+    else await interaction.reply({ content, ephemeral: true }).catch(() => {});
+    return null;
+  }
+
+  const last = db.cooldowns[user.id] || 0;
+  const cooldownMs = 3 * 60 * 1000;
+  const elapsed = Date.now() - last;
+  if (elapsed < cooldownMs) {
+    const secs = Math.ceil((cooldownMs - elapsed) / 1000);
+    const content = `Please wait ${secs}s before opening another ticket.`;
+    if (interaction.deferred || interaction.replied) await interaction.editReply({ content }).catch(() => {});
+    else await interaction.reply({ content, ephemeral: true }).catch(() => {});
+    return null;
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    await interaction.reply({ content: creatingMessage, ephemeral: true }).catch(() => {});
+  } else {
+    await interaction.editReply({ content: creatingMessage }).catch(() => {});
+  }
+
+  const code = generateTicketNumber();
+  const overwrites = [
+    { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+    ...getStaffRoleIds().map(rid => ({ id: rid, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles] })),
+    { id: user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
+    { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageMessages, PermissionsBitField.Flags.EmbedLinks] }
+  ];
+  const channelData = { name: buildTicketChannelName(user, safeSubject), type: 0, permissionOverwrites: overwrites };
+  if (TICKET_CATEGORY_ID) channelData.parent = TICKET_CATEGORY_ID;
+  const ticketChannel = await guild.channels.create(channelData).catch(err => {
+    console.error('create channel failed', err);
+    try { notifyStaffError(err, `${source} create channel`, interaction); } catch {}
+    return null;
+  });
+  if (!ticketChannel) {
+    await interaction.editReply({ content: 'Failed to create ticket channel.' }).catch(() => {});
+    return null;
+  }
+
+  const initMsg = String(db.initMessage || '').replace('{subject}', safeSubject);
+  await ticketChannel.send({ content: `<@${user.id}>\n${initMsg}` }).catch(() => {});
+
+  db.tickets[code] = {
+    ticketChannelId: ticketChannel.id,
+    studentId: user.id,
+    studentName: user.username,
+    studentTag: user.tag,
+    tutorMessageId: null,
+    tutorThreadId: null,
+    selectedTutorId: selectedTutorId || null,
+    subject: safeSubject,
+    approved: false,
+    awaitingApproval: false,
+    tutorCount: 0,
+    tutorMap: {},
+    messages: [],
+    createdAt: Date.now()
+  };
+  db.cooldowns[user.id] = Date.now();
+  saveDB();
+
+  await interaction.editReply({ content: `Ticket created for <@${user.id}> (code **${code}**). ${successVerb} <#${ticketChannel.id}>.` }).catch(() => {});
+  await ticketChannel.send(`Ticket created for <@${user.id}> (code **${code}**), subject: ${safeSubject}`).catch(() => {});
+  return { code, ticketChannel };
 }
 
 function getTutorIdsForLevel(levelKey) {
@@ -1077,22 +1164,22 @@ async function cleanupLegacyInactivityTickets() {
 async function initializeDB() {
   let shouldSeedAppwrite = false;
   if (appwriteClient.isConfigured()) {
-    console.log('[Appwrite] Configured; starting initial load.');
+    console.log('[BotDB] Configured; starting initial load.');
     try {
       const appwriteData = await appwriteClient.loadDB();
       if (appwriteData && Object.keys(appwriteData).length > 0) {
         Object.assign(db, appwriteData);
-        console.log('[Appwrite] Initial load completed.');
+        console.log('[BotDB] Initial load completed.');
         return;
       }
-      console.log('[Appwrite] Initial load returned no records; checking local bootstrap data.');
+      console.log('[BotDB] Initial load returned no records; checking local bootstrap data.');
       shouldSeedAppwrite = true;
     } catch (e) {
-      console.warn('[Appwrite] Initial load failed, falling back to local data.json:', e.message);
+      console.warn('[BotDB] Initial load failed, falling back to local data.json:', e.message);
       shouldSeedAppwrite = true;
     }
   } else {
-    console.log('[Appwrite] Not configured; running in local JSON mode.');
+    console.log('[BotDB] Not configured; running in local JSON mode.');
   }
 
   loadDB();
@@ -1538,6 +1625,26 @@ try {
   try { notifyStaffError(e, 'initModmail'); } catch (err) { console.warn('notify staff failed for initModmail', err); }
 }
 
+// register Alvey AI assistant
+try {
+  initAIAssistant({
+    client,
+    db,
+    saveDB,
+    createEnquiryTicket: createEnquiryTicketFromInteraction,
+    notifyError: async (err, ctx = {}) => {
+      try {
+        await notifyStaffError(err, ctx.module || 'ai-assistant', ctx.interaction || ctx.message || ctx);
+      } catch (notifyErr) {
+        console.warn('notifyStaffError failed from ai-assistant notifyError', notifyErr);
+      }
+    }
+  });
+} catch (e) {
+  console.warn('initAIAssistant threw', e);
+  try { notifyStaffError(e, 'initAIAssistant'); } catch (err) { console.warn('notify staff failed for initAIAssistant', err); }
+}
+
 // register demo module
 try {
   // Make db accessible to demo.js
@@ -1803,6 +1910,16 @@ async function registerCommands() {
     { name: 'editinit', description: 'Open modal to edit the initial ticket message (staff only)', default_member_permissions: PermissionFlagsBits.ManageMessages.toString() },
     { name: 'help', description: 'Show available user commands' },
     { name: 'staffhelp', description: 'Show staff commands', default_member_permissions: PermissionFlagsBits.ManageMessages.toString() },
+    {
+      name: 'aichannel',
+      description: 'Set the public channel where Alvey Assistant listens',
+      options: [
+        { name: 'set', description: 'Set Alvey Assistant channel', type: 1, options: [
+          { name: 'channel', description: 'Public channel for Alvey Assistant mentions', type: 7, required: true, channel_types: [ChannelType.GuildText] }
+        ] }
+      ],
+      default_member_permissions: PermissionFlagsBits.ManageMessages.toString()
+    },
     { name: 'bumpleaderboard', description: 'Show the bump leaderboard - see who has bumped the server the most!' },
     // student & review commands
     { name: 'student', description: 'Manage student assignments', options: [
@@ -2083,61 +2200,13 @@ client.on('interactionCreate', async (interaction) => {
             }
           }
         } catch (e) { console.warn('ad_enquire tutor resolution failed', e); }
-        const user = interaction.user;
-        const existing = findOpenTicketForUserSubject(user.id, subject);
-        if (existing) {
-          const existingChannel = await interaction.guild.channels.fetch(existing.ticket.ticketChannelId).catch(() => null);
-          const where = existingChannel ? ` in <#${existingChannel.id}>` : '';
-          return interaction.reply({ content: `You already have an open ticket for **${existing.ticket.subject}**${where}. Please close it before opening another.`, ephemeral: true }).catch(() => {});
-        }
-        const last = db.cooldowns[user.id] || 0;
-        const cooldownMs = 3 * 60 * 1000;
-        const elapsed = Date.now() - last;
-        if (elapsed < cooldownMs) {
-          const msLeft = cooldownMs - elapsed;
-          const secs = Math.ceil(msLeft / 1000);
-          return interaction.reply({ content: `Please wait ${secs}s before opening another ticket.`, ephemeral: true }).catch(() => {});
-        }
-
-        await interaction.reply({ content: `Creating ticket for ${subject}...`, ephemeral: true }).catch(() => {});
-        const guild = interaction.guild;
-        const code = generateTicketNumber();
-
-        const overwrites = [
-          { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-          ...getStaffRoleIds().map(rid => ({ id: rid, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory, PermissionsBitField.Flags.AttachFiles] })),
-          { id: user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] },
-          { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ManageMessages, PermissionsBitField.Flags.EmbedLinks] }
-        ];
-        const channelData = { name: buildTicketChannelName(user, subject), type: 0, permissionOverwrites: overwrites };
-        if (TICKET_CATEGORY_ID) channelData.parent = TICKET_CATEGORY_ID;
-        const ticketChannel = await guild.channels.create(channelData).catch(err => { console.error('create channel failed', err); try { notifyStaffError(err, 'ad_enquire create channel', interaction); } catch {} return null; });
-        if (!ticketChannel) return interaction.editReply({ content: `Failed to create ticket channel.`, ephemeral: true }).catch(() => {});
-
-        const initMsg = db.initMessage.replace('{subject}', subject);
-        await ticketChannel.send({ content: `<@${user.id}>\n${initMsg}` }).catch(() => {});
-
-        db.tickets[code] = {
-          ticketChannelId: ticketChannel.id,
-          studentId: user.id,
-          studentName: user.username,
-          studentTag: user.tag,
-          tutorMessageId: null,
-          tutorThreadId: null,
-          selectedTutorId: selectedTutorId || null,
+        await createEnquiryTicketFromInteraction(interaction, {
           subject,
-          approved: false,
-          awaitingApproval: false,
-          tutorCount: 0,
-          tutorMap: {},
-          messages: [],
-          createdAt: Date.now()
-        };
-        db.cooldowns[user.id] = Date.now();
-        saveDB();
-
-        await interaction.editReply({ content: `Ticket created for <@${user.id}> (code **${code}**). See <#${ticketChannel.id}>.` }).catch(() => {});
-        await ticketChannel.send(`Ticket created for <@${user.id}> (code **${code}**), subject: ${subject}`).catch(() => {});
+          selectedTutorId,
+          source: 'ad_enquire',
+          creatingMessage: `Creating ticket for ${subject}...`,
+          successVerb: 'See'
+        });
         return;
       }
       // Button to open the create-ad modal after usernames were resolved
@@ -2983,14 +3052,6 @@ client.on('interactionCreate', async (interaction) => {
                 }
               }
             } catch (e) { console.warn('Failed to send post-createad modmail prompt', e); }
-
-            // Trigger sticky repost in find channel so sticky is always fresh after createad
-            try {
-                await repostStickyInChannel(findCh);
-            } catch (e) {
-                console.warn('sticky repost after createad failed', e);
-                try { notifyStaffError(e, 'repostSticky after createad', interaction); } catch (err) {}
-            }
 
             const levelLabel = CREATEAD_LEVEL_LABELS[levelKey] || 'Other';
             return interaction.editReply({ content: categorySent ? `Ad posted in find-a-tutor and **${levelLabel}**.` : `Ad posted in find-a-tutor. (Could not post in **${levelLabel}** category channel.)` }).catch(() => {});
@@ -4312,27 +4373,14 @@ client.on('interactionCreate', async (interaction) => {
 
       // ENQUIRE (unchanged)
       if (cmd === 'enquire') {
-        const uid = interaction.user.id;
-        const last = db.cooldowns[uid] || 0;
-        const cooldownMs = 3 * 60 * 1000;
-        const elapsed = Date.now() - last;
-        if (elapsed < cooldownMs) {
-          const msLeft = cooldownMs - elapsed;
-          const secs = Math.ceil(msLeft / 1000);
-          return interaction.reply({ content: `Please wait ${secs}s before creating another enquiry.`, ephemeral: true }).catch(() => {});
-        }
-
-        await interaction.reply({ content: 'Creating your ticket...', ephemeral: true }).catch(() => {});
-
-        const subject = interaction.options.getString('subject', true);
-        const existing = findOpenTicketForUserSubject(interaction.user.id, subject);
-        if (existing) {
-          const existingChannel = await interaction.guild.channels.fetch(existing.ticket.ticketChannelId).catch(() => null);
-          const where = existingChannel ? ` in <#${existingChannel.id}>` : '';
-          return interaction.editReply({ content: `You already have an open ticket for **${existing.ticket.subject}**${where}. Please close it before opening another.` }).catch(() => {});
-        }
-        const guild = interaction.guild;
-        const code = generateTicketNumber();
+        const enquirySubject = interaction.options.getString('subject', true);
+        await createEnquiryTicketFromInteraction(interaction, {
+          subject: enquirySubject,
+          source: 'enquire',
+          creatingMessage: 'Creating your ticket...',
+          successVerb: 'Continue in'
+        });
+        return;
 
         const overwrites = [
           { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
@@ -5418,7 +5466,21 @@ if (cmd === 'createad') {
 
       if (cmd === 'staffhelp') {
         if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can access this.', ephemeral: true }).catch(() => {});
-        return interaction.reply({ content: `Staff Commands:\n/subject add/remove/list [level] [tutor-assigned:yes/no/all]\n/tutor add/remove/list/info/notes/edit [user:@mention]\n/ad create|edit|delete\n/keyword set|list|remove\n/sticky\n/embedcolor\n/editinit\n/close\n/student add/remove/list [filters]\n/modmailmap [purpose/category]\n/reviewreminder\n/seedsubjects`, ephemeral: true }).catch(() => {});
+        return interaction.reply({ content: `Staff Commands:\n/subject add/remove/list [level] [tutor-assigned:yes/no/all]\n/tutor add/remove/list/info/notes/edit [user:@mention]\n/ad create|edit|delete\n/keyword set|list|remove\n/aichannel set\n/sticky\n/embedcolor\n/editinit\n/close\n/student add/remove/list [filters]\n/modmailmap [purpose/category]\n/reviewreminder\n/seedsubjects`, ephemeral: true }).catch(() => {});
+      }
+
+      if (cmd === 'aichannel') {
+        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can configure Alvey Assistant.', ephemeral: true }).catch(() => {});
+        let action = null;
+        try { action = interaction.options.getSubcommand(false); } catch (e) {}
+        if (action !== 'set') return interaction.reply({ content: 'Use `/aichannel set channel:#channel`.', ephemeral: true }).catch(() => {});
+        const channel = interaction.options.getChannel('channel', true);
+        if (!channel || channel.type !== ChannelType.GuildText) {
+          return interaction.reply({ content: 'Please choose a public text channel.', ephemeral: true }).catch(() => {});
+        }
+        db.aiChannelId = channel.id;
+        saveDB();
+        return interaction.reply({ content: `Alvey Assistant will now respond to mentions in <#${channel.id}>.`, ephemeral: true }).catch(() => {});
       }
 
       // bumpleaderboard command
@@ -5956,16 +6018,6 @@ client.on('messageCreate', async (message) => {
           await message.channel.send({ content: automation.response.substring(0, 2000) }).catch(() => {});
           break;
         }
-      }
-    }
-
-    // sticky: if any message posted in find-a-tutor, repost sticky immediately (no staff ping)
-    if (String(message.channel.id) === String(FIND_A_TUTOR_CHANNEL_ID)) {
-      try {
-        await repostStickyInChannel(message.channel);
-      } catch (e) {
-        console.warn('sticky repost failed', e);
-        try { notifyStaffError(e, 'messageCreate repostSticky', message); } catch (err) {}
       }
     }
 
