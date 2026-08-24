@@ -1,8 +1,85 @@
-# Isofusie — Discord Tutoring Platform Bot
-
-Isofusie is a feature-rich Discord bot built for managing a tutoring community server. It provides a complete workflow for matching students with tutors, handling enquiries, managing tutor advertisements, collecting reviews, recording voice sessions, and running a modmail support system.
+# Alvey Discord Bot
+ 
+With AI Integration!!
 
 ---
+## Tech Stack
+
+- **[discord.js](https://discord.js.org/) v14** — Core Discord API library
+- **[Express](https://expressjs.com/) v5** — Web server
+- **[dotenv](https://github.com/motdotla/dotenv)** — Environment variable loading
+- **[Appwrite](https://appwrite.io/)** — Optional cloud data persistence (falls back to local `data.json`)
+
+---
+
+## Requirements
+
+- Node.js 18 or later (Node.js 20 LTS recommended)
+- A Discord application & bot token ([Discord Developer Portal](https://discord.com/developers/applications))
+- The bot must be invited to the server with the required intents and slash-command permissions
+
+---
+
+
+
+## Installation
+
+```bash
+# 1. Clone the repository
+git clone <repository-url>
+cd 
+
+# 2. Install dependencies
+npm install
+
+# 3. Create a .env file (see Configuration section below)
+
+# 4. Start the bot
+node index.js
+```
+
+---
+
+## Configuration
+
+Create a `.env` file (local development) or set the same values in your hosting provider's environment panel. Required variables are marked with ✱.
+
+| Variable | Required | Description |
+|---|---|---|
+| `BOT_TOKEN` | ✱ | Discord bot token |
+| `GUILD_ID` | ✱ | Discord server (guild) ID |
+| `STAFF_ROLE_ID` | ✱ | Staff role ID(s) |
+| `FIND_A_TUTOR_CHANNEL_ID` | ✱ | Channel where the sticky message lives |
+| `TUTORS_FEED_CHANNEL_ID` | ✱ | Channel for tutor feed announcements |
+| `STAFF_CHAT_ID` | | Channel for staff notifications and bot error reports |
+| `TICKET_CATEGORY_ID` | | Category for enquiry ticket channels |
+| `TRANSCRIPTS_CHANNEL_ID` | | Channel where ticket transcripts are posted |
+| `TUTOR_CHAT_CHANNEL_ID` | | Channel for internal tutor discussions |
+| `TUTOR_POLICIES_CHANNEL_ID` | | Channel for tutor policy documents |
+| `MODMAIL_CATEGORY_ID` | | Default category for modmail channels |
+| `MODMAIL_TRANSCRIPTS_CHANNEL_ID` | | Channel for modmail transcripts |
+| `BUMP_CHANNEL_ID` | | Channel to restrict bump tracking (all channels if omitted) |
+| `DISCORD_CLIENT_ID` | | Discord OAuth2 client ID (for web dashboard login) |
+| `DISCORD_CLIENT_SECRET` | | Discord OAuth2 client secret |
+| `DISCORD_REDIRECT_URI` | | OAuth2 redirect URI (auto-detected if omitted) |
+| `SYNC_SECRET` | | Shared secret for external webhook sync |
+| `SYNC_WEBHOOK_URL` | | External webhook URL to sync data to |
+
+---
+
+## Data Storage
+
+All persistent data is stored locally in **`data.json`** (or in Appwrite if configured), including:
+
+- Subject and subject-level mappings
+- Tutor profiles, assigned subjects, and notes
+- Student-tutor assignments
+- Ticket records and transcript metadata
+- Pending and approved reviews
+- Bump leaderboard counts
+- Modmail ticket records and per-category counters
+- Bot configuration (embed colour, initial message, review reminder delay)
+
 
 ## Features
 
@@ -12,6 +89,7 @@ Isofusie is a feature-rich Discord bot built for managing a tutoring community s
 - Staff close tickets with `/close <code>`, specifying a reason and assigning a tutor
 - Closed tickets generate a transcript posted to a configurable transcripts channel
 - A review reminder is automatically sent to the student after a configurable delay
+- Tickets with no student message within 24 hours are automatically closed
 
 ### 📬 Modmail System
 - Students initiate modmail sessions by sending a DM to the bot
@@ -20,28 +98,19 @@ Isofusie is a feature-rich Discord bot built for managing a tutoring community s
   - **C** — Complaints & Suggestions
   - **S** — Customer Service
   - **P** — Payment
-- Staff can remap those categories with `/modmailmap` using a Discord category picker instead of editing IDs
+- Staff can remap those categories with `/modmailmap` using a Discord category picker
 - Each category maintains its own independent ticket counter
 - 120-second per-user cooldown per category prevents spam
 - Staff messages are forwarded into the ticket channel; student messages are forwarded back to the user's DM
 - Reaction feedback (✅ / ❌) confirms whether forwarding succeeded
 - Closing a ticket triggers a modal to collect a closure reason and posts a full transcript
 
-### 📢 Tutor Advertisement Management
-- Create rich-embed tutor ads with `/ad create` (select level category, then type subject and optional tutor in the ad form modal)
-- Edit existing ads with `/ad edit <messageId>` (modal pre-filled with current values)
-- Delete and archive ads with `/ad delete <messageId> <reason>`
-- Ads are automatically organised into level-based category channels:
-  - IGCSE Tutors, AS/A Level Tutors, Below IGCSE Tutors, University Tutors, Language Tutors, Test Prep Tutors, Other Tutors
-- "Talk to Tutor" button on each ad opens an enquiry ticket for that ad's tutor and subject
-
 ### ⭐ Review System
-- Students receive a review prompt with a direct link after a ticket closes
-- Reviews are submitted via a modal (rating + written feedback)
+- Students receive a review prompt after a ticket closes (configurable delay via `/reviewreminder`)
+- Reviews are submitted via a modal (rating 1–5 stars + written feedback)
 - Submitted reviews enter a pending queue for staff approval
-- Staff approve reviews with a button; approved reviews appear in the tutor's profile embed
-- Staff can redact individual reviews if needed
-- Tutor profile embeds show average rating and all approved reviews
+- Staff approve, deny, or redact reviews using buttons in the staff chat channel
+- Approved reviews are stored on the tutor's profile with a running average rating
 
 ### 👩‍🏫 Tutor Management
 - Add or remove tutors with `/tutor add|remove <user>`
@@ -53,139 +122,42 @@ Isofusie is a feature-rich Discord bot built for managing a tutoring community s
 ### 📚 Subject Management
 - Add, remove, and list subjects with `/subject add|remove|list`
 - Link subjects to academic levels (IGCSE, A Level, Below IGCSE, University, Language, Test Prep, Other)
-- Assign a default tutor to a subject with `/subject tutor-assigned`
+- Filter subject listings by level and tutor-assignment status
 - Seed a standard set of IGCSE / AS / A Level subjects with `/seedsubjects`
 
 ### 🧑‍🎓 Student Assignment
-- Assign students to a tutor with `/student add` using Discord user pickers for both the student and tutor
-- Remove student assignments with `/student remove` using the same picker-based flow
+- Assign students to a tutor with `/student add` using Discord user pickers
+- Remove student assignments with `/student remove`
 - List student assignments with `/student list`, with optional tutor and subject filters
 - Student assignment data is stored per tutor and visible in their profile
 
-### 🎙️ Voice Recording (Demo Sessions)
-- Start a multi-track voice recording session with `/startdemo <student> <title>`
-- Each participant's audio is captured to a separate `.opus` file in real time
-- Recording metadata (ID, tutor, student, participants, timestamp) is stored in `recordings/metadata.json`
-- Recordings are accessible through the authenticated web interface
-
-### 🌐 Web Dashboard
-- Express-based web server running on port **9904**
-- Generate a short-lived authentication code (2-minute expiry, SHA-256 hashed) with `/authentication`
-- Alternatively authenticate via Discord OAuth2
-- Authenticated users can list, stream, and download individual audio tracks
-- Rate-limited to 10 requests per minute per IP
-- Directory-traversal protection on all file-serving endpoints
-- Recordings can be deleted via the dashboard using a delete key
+### 📌 Sticky Messages
+- Staff can create or update a sticky welcome/info message in find-a-tutor via `/sticky`
+- The sticky is reposted when staff run `/sticky` again — it does not auto-repost on every message
 
 ### 🏆 Bump Leaderboard
 - Automatically tracks DISBOARD bump interactions
 - Displays a ranked leaderboard via `/bumpleaderboard`
 - Optionally restricted to a configured bump channel
 
+### 🤖 Alvey AI Assistant
+- Responds to mentions in a configured public channel
+- Channel is set with `/aichannel set`
+
 ### 🛠️ Admin & Utility Commands
-- `/sticky` — Create or edit a sticky welcome/info message in a channel (modal-based)
+- `/sticky` — Create or edit the sticky message in find-a-tutor (modal-based)
 - `/embedcolor <hex>` — Set the default embed accent colour for the bot
 - `/editinit` — Edit the initial message shown when a ticket is opened (modal-based)
-- `/reviewreminder <seconds>` — Configure the delay before a review prompt is sent after ticket closure
-- `/keyword set|list|remove` — Manage server-wide trigger keyword responses
+- `/reviewreminder <seconds>` — Configure the delay before a review prompt is sent
+- `/keyword set|list|remove` — Manage server-wide trigger keyword auto-responses
+- `/modmailmap` — Map a modmail purpose to a Discord category channel
+- `/seedsubjects` — Seed the standard IGCSE / AS / A Level subject list (idempotent)
 - `/staffhelp` — Display the full list of staff-only commands
 - `/help` — Display user-facing commands
 
----
-
-## Tech Stack
-
-- **[discord.js](https://discord.js.org/) v14** — Core Discord API library
-- **[@discordjs/voice](https://github.com/discordjs/discord.js/tree/main/packages/voice)** — Voice channel connection & audio capture
-- **[Express](https://expressjs.com/) v5** — Web server and REST API
-- **[dotenv](https://github.com/motdotla/dotenv)** — Environment variable loading
-- **[ffmpeg-static](https://github.com/eugeneware/ffmpeg-static)** — Bundled FFmpeg binaries for audio processing
+### 🌐 Web Dashboard
+- Express-based web server running on port **9904**
+- Authenticate via Discord OAuth2
+- Rate-limited to 10 requests per minute per IP
 
 ---
-
-## Requirements
-
-- Node.js 18 or later (Node.js 20 LTS recommended; required by `dotenv` v17 and `discord.js` v14)
-- A Discord application & bot token ([Discord Developer Portal](https://discord.com/developers/applications))
-- The bot must be invited to the server with the required intents and slash-command permissions
-
----
-
-## Installation
-
-```bash
-# 1. Clone the repository
-git clone <repository-url>
-cd isofusie
-
-# 2. Install dependencies
-npm install
-
-# 3. Create a .env file (see Configuration section below)
-
-# 4. Start the bot
-node index.js
-```
-
-### Wispbyte deployment notes (important)
-
-- Set variables in the Wispbyte environment/variables panel.
-- Do not upload a `.env` directory. If a `.env` path exists, it must be a file.
-- Use startup command: `node index.js`
-- Confirm the working directory is `/home/container` so `package.json` is resolved correctly.
-
-If logs show `ENOTDIR` for `/home/container/.env/package.json`, delete the `.env` directory on the host and re-add variables via the panel.
-
----
-
-## Configuration
-
-Create a `.env` file (local development) and fill in the values for your server. On Wispbyte, prefer setting the same values in the environment/variables panel. Required variables are marked with ✱.
-
-| Variable | Required | Description |
-|---|---|---|
-| `BOT_TOKEN` | ✱ | Discord bot token |
-| `GUILD_ID` | ✱ | Discord server (guild) ID |
-| `STAFF_ROLE_ID` | ✱ | Staff role ID(s); set this to Manager and Isofusie only |
-| `FIND_A_TUTOR_CHANNEL_ID` | ✱ | Channel where tutor ads are posted |
-| `TUTORS_FEED_CHANNEL_ID` | ✱ | Channel for tutor feed announcements |
-| `STAFF_CHAT_ID` | | Channel for staff notifications and bot error reports |
-| `TICKET_CATEGORY_ID` | | Category for enquiry ticket channels |
-| `TRANSCRIPTS_CHANNEL_ID` | | Channel where ticket transcripts are posted |
-| `TUTOR_CHAT_CHANNEL_ID` | | Channel for internal tutor discussions |
-| `TUTOR_POLICIES_CHANNEL_ID` | | Channel for tutor policy documents |
-| `MODMAIL_CATEGORY_ID` | | Default category for modmail channels |
-| `MODMAIL_TRANSCRIPTS_CHANNEL_ID` | ✱ | Channel for modmail transcripts |
-| `BUMP_CHANNEL_ID` | | Channel to restrict bump tracking (all channels if omitted) |
-| `ADS_CHANNEL_ID` | | Channel for ad archive posts |
-| `ARCHIVED_ADS_CHANNEL_ID` | | Channel for archived/deleted ads |
-| `DISCORD_CLIENT_ID` | | Discord OAuth2 client ID (for web dashboard login) |
-| `DISCORD_CLIENT_SECRET` | | Discord OAuth2 client secret |
-| `DISCORD_REDIRECT_URI` | | OAuth2 redirect URI (auto-detected if omitted) |
-| `SERVER_HOST` | | Hostname or IP for the web dashboard (used in recording links) |
-| `SYNC_SECRET` | | Shared secret for external webhook sync |
-| `SYNC_WEBHOOK_URL` | | External webhook URL to sync data to |
-
----
-
-## Data Storage
-
-All persistent data is stored locally in **`data.json`**, including:
-
-- Subject and subject-level mappings
-- Tutor profiles, assigned subjects, and notes
-- Student-tutor assignments
-- Ticket records and transcript metadata
-- Pending and approved reviews
-- Tutor ad content and archived ads
-- Bump leaderboard counts
-- Modmail ticket records and per-category counters
-- Bot configuration (embed colour, initial message, review reminder delay)
-
----
-
-## Voice Recordings Storage
-
-- Recordings are saved under `./recordings/<recordingId>/`
-- Each participant's audio is stored as `<userId>.opus`
-- Global metadata is stored in `./recordings/metadata.json`
