@@ -243,33 +243,6 @@ async function loadArrayCollection(collectionId) {
   return docs.map(doc => safeJSON(doc.data)).filter(v => v !== null);
 }
 
-/**
- * Sync tutor ads (db.createAds) into the public `ads` collection.
- *
- * This repo's internal ads format is stored in `db.createAds` keyed by the
- * Discord messageId. The Appwrite `ads` collection in your project is
- * website-facing and uses explicit fields (title/body/status/Source/...).
- */
-async function syncAdsCollection(createAds) {
-  if (!createAds || typeof createAds !== 'object') return;
-  for (const [messageId, ad] of Object.entries(createAds)) {
-    const title = String(ad?.embed?.title || ad?.title || '').trim() || 'Untitled';
-    const description = String(ad?.embed?.description || ad?.body || '').trim() || '(no description)';
-    const createdBy = ad?.tutorId ? String(ad.tutorId) : null;
-    const status = String(ad?.status || 'active');
-
-    await upsertDoc(COLLECTION_IDS.ads, String(messageId), {
-      title,
-      description,
-      body: description,
-      status,
-      Source: JSON.stringify({ origin: 'discordbot', messageId, ad }),
-      messageId: String(messageId),
-      createdBy,
-    });
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Public API: syncDB / loadDB
 // ---------------------------------------------------------------------------
@@ -282,12 +255,6 @@ export async function syncDB(db) {
   if (!getDB()) return; // not configured
   try {
     await Promise.all([
-      // Active ads state (full payload for bot restarts)
-      syncMapCollection(COLLECTION_IDS.createAds, db.createAds),
-
-      // Ads (public website-facing collection)
-      syncAdsCollection(db.createAds),
-
       // Single-document collections
       syncSingleDoc(COLLECTION_IDS.subjects,      'all',    db.subjects),
       syncSingleDoc(COLLECTION_IDS.subjectLevels, 'all',    db.subjectLevels),
@@ -295,9 +262,7 @@ export async function syncDB(db) {
       syncSingleDoc(COLLECTION_IDS.reviewConfig,  'config', db.reviewConfig),
       syncSingleDoc(COLLECTION_IDS.modmail,       'all',    db.modmail),
       syncSingleDoc(COLLECTION_IDS.initMessage,   'config', { message: db.initMessage }),
-      syncSingleDoc(COLLECTION_IDS.nextAdCodes,   'all',    db.nextAdCodes),
       syncSingleDoc(COLLECTION_IDS.nextTicketId,  'counter', db.nextTicketId),
-      syncMapCollection(COLLECTION_IDS.archivedAds, db.archivedAds),
       syncSingleDoc(COLLECTION_IDS.defaultEmbedColor, 'config', db.defaultEmbedColor),
       syncSingleDoc(COLLECTION_IDS.sticky,        'config', db.sticky),
       syncSingleDoc(COLLECTION_IDS.aiChannel,     'config', db.aiChannelId),
@@ -309,7 +274,6 @@ export async function syncDB(db) {
       syncMapCollection(COLLECTION_IDS.cooldowns,          db.cooldowns),
       syncMapCollection(COLLECTION_IDS.bumpLeaderboard,    db.bumpLeaderboard),
       syncMapCollection(COLLECTION_IDS.tickets,            db.tickets),
-      syncMapCollection(COLLECTION_IDS.tempCreateAd,       db._tempCreateAd),
       syncMapCollection(COLLECTION_IDS.tempTutorAdd,       db._tempTutorAdd),
       syncMapCollection(COLLECTION_IDS.tempTutorRemove,    db._tempTutorRemove),
 
@@ -338,10 +302,7 @@ export async function loadDB() {
       reviewConfig,
       modmailRaw,
       initMessageRaw,
-      nextAdCodes,
-      createAds,
       nextTicketId,
-      archivedAds,
       defaultEmbedColor,
       sticky,
       aiChannelId,
@@ -352,7 +313,6 @@ export async function loadDB() {
       cooldowns,
       bumpLeaderboard,
       tickets,
-      tempCreateAd,
       tempTutorAdd,
       tempTutorRemove,
     ] = await Promise.all([
@@ -362,10 +322,7 @@ export async function loadDB() {
       loadSingleDoc(COLLECTION_IDS.reviewConfig,  'config'),
       loadSingleDoc(COLLECTION_IDS.modmail,       'all'),
       loadSingleDoc(COLLECTION_IDS.initMessage,   'config'),
-      loadSingleDoc(COLLECTION_IDS.nextAdCodes,   'all'),
-      loadMapCollection(COLLECTION_IDS.createAds),
       loadSingleDoc(COLLECTION_IDS.nextTicketId,  'counter'),
-      loadMapCollection(COLLECTION_IDS.archivedAds),
       loadSingleDoc(COLLECTION_IDS.defaultEmbedColor, 'config'),
       loadSingleDoc(COLLECTION_IDS.sticky,        'config'),
       loadSingleDoc(COLLECTION_IDS.aiChannel,     'config'),
@@ -376,7 +333,6 @@ export async function loadDB() {
       loadMapCollection(COLLECTION_IDS.cooldowns),
       loadMapCollection(COLLECTION_IDS.bumpLeaderboard),
       loadMapCollection(COLLECTION_IDS.tickets),
-      loadMapCollection(COLLECTION_IDS.tempCreateAd),
       loadMapCollection(COLLECTION_IDS.tempTutorAdd),
       loadMapCollection(COLLECTION_IDS.tempTutorRemove),
     ]);
@@ -390,10 +346,7 @@ export async function loadDB() {
     if (modmailRaw    !== null) result.modmail       = modmailRaw;
     if (initMessageRaw!== null && initMessageRaw.message !== undefined)
       result.initMessage = initMessageRaw.message;
-    if (nextAdCodes   !== null) result.nextAdCodes   = nextAdCodes;
-    if (createAds     && Object.keys(createAds).length) result.createAds = createAds;
     if (nextTicketId  !== null) result.nextTicketId  = nextTicketId;
-    if (archivedAds   && Object.keys(archivedAds).length) result.archivedAds = archivedAds;
     if (defaultEmbedColor !== null) result.defaultEmbedColor = defaultEmbedColor;
     if (sticky        !== null) result.sticky        = sticky;
     if (aiChannelId   !== null) result.aiChannelId   = aiChannelId;
@@ -405,7 +358,6 @@ export async function loadDB() {
     if (cooldowns          && Object.keys(cooldowns).length)           result.cooldowns          = cooldowns;
     if (bumpLeaderboard    && Object.keys(bumpLeaderboard).length)     result.bumpLeaderboard    = bumpLeaderboard;
     if (tickets            && Object.keys(tickets).length)             result.tickets            = tickets;
-    if (tempCreateAd       && Object.keys(tempCreateAd).length)        result._tempCreateAd      = tempCreateAd;
     if (tempTutorAdd       && Object.keys(tempTutorAdd).length)        result._tempTutorAdd      = tempTutorAdd;
     if (tempTutorRemove    && Object.keys(tempTutorRemove).length)     result._tempTutorRemove   = tempTutorRemove;
 

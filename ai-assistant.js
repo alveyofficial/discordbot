@@ -8,7 +8,7 @@ import {
 import { isWebsiteConfigured, loadTutorContext } from './appwrite/appwrite-website-reader.js';
 
 const HISTORY_LIMIT = 10;
-const CONTEXT_REFRESH_MS = 5 * 60 * 1000;
+const CONTEXT_REFRESH_MS = 5 * 60 * 1000; //5 mins
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 const conversationHistory = new Map();
@@ -86,12 +86,12 @@ function buildContextSnapshot(rawContext) {
 }
 
 function buildSystemPrompt(contextSnapshot) {
-  return `You are Alvey Assistant, the professional and friendly AI assistant for the Alvey tutoring Discord server.
-Reply primarily in English. If the user clearly writes in another language, adapt politely to that language while keeping names, subjects, and booking details clear.
+  return `You are Alvey AI Assistant, the professional and friendly AI assistant for the Alvey Discord server which connects students and tutors.
+Reply primarily in English. If the user uses another language, request them to ask in english.
 
 Use only the tutor, subject, and pricing context below. If data is missing or uncertain, say so and offer to connect the user with staff.
-
-You can answer tutor questions, explain subjects/pricing, help users choose a tutor, and guide them toward booking.
+Do not go off topic, if the user tries, remind them you are only here to help them find a tutor or become one. Keep the rejection under 20 words.
+You can help people apply as a tutor, explain subjects/pricing, help users choose a tutor, and guide them toward booking.
 When the user is ready to book or asks to open/create/start an enquiry ticket, include a compact JSON object on its own line:
 {"intent":"create_ticket","subject":"subject name","tutorId":"optional tutor id or empty string","summary":"brief booking summary"}
 Do not include that JSON unless the user has a concrete booking/enquiry intent.
@@ -193,7 +193,7 @@ export default function initAIAssistant({ client, db, saveDB, createEnquiryTicke
         .setDescription(summary.slice(0, 3500))
         .addFields(
           { name: 'Subject', value: subject.slice(0, 1024) },
-          { name: 'Next step', value: 'Confirm to create a private in-server enquiry ticket with staff.' }
+          { name: 'Next step', value: 'Confirm to create a private in-server enquiry ticket to talk to the tutor under staff supervision.' }
         )
         .setTimestamp();
       const row = new ActionRowBuilder().addComponents(
@@ -216,11 +216,11 @@ export default function initAIAssistant({ client, db, saveDB, createEnquiryTicke
       if (!interaction.isButton() || !interaction.customId.startsWith('ai_confirm_ticket|')) return;
       const [, userId, nonce] = interaction.customId.split('|');
       if (String(interaction.user.id) !== String(userId)) {
-        return interaction.reply({ content: 'This confirmation button belongs to the user who asked Alvey.', ephemeral: true }).catch(() => {});
+        return interaction.reply({ content: 'This confirmation button belongs to the user who asked me this. stay out of it you outsider!', ephemeral: true }).catch(() => {});
       }
       const pending = pendingTicketConfirmations.get(nonce);
       if (!pending) {
-        return interaction.reply({ content: 'This booking confirmation has expired. Please mention Alvey again to create a fresh one.', ephemeral: true }).catch(() => {});
+        return interaction.reply({ content: 'This booking confirmation has expired. Please mention me again to create a fresshh one.', ephemeral: true }).catch(() => {});
       }
       pendingTicketConfirmations.delete(nonce);
       await createEnquiryTicket(interaction, {

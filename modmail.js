@@ -686,29 +686,9 @@ ${String(err && (err.stack || err))}`;
         
         await interaction.deferUpdate().catch(() => {});
         
-        if (selectedSubject === '__add_new__') {
-          // Show a modal to add a new subject
-          const modal = new ModalBuilder()
-            .setCustomId(`mm_add_subject_modal|${channelId}`)
-            .setTitle('Add New Subject');
-          
-          const subjectInput = new TextInputBuilder()
-            .setCustomId('mm_subject_name')
-            .setLabel('Subject Name')
-            .setPlaceholder('e.g., IGCSE Chemistry')
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true);
-          
-          modal.addComponents(new ActionRowBuilder().addComponents(subjectInput));
-          await interaction.showModal(modal).catch(e => {
-            console.warn('showModal for add subject failed', e);
-          });
-          return;
-        }
-        
         // Subject was selected from the dropdown
         ticket.applicationSubject = selectedSubject;
-        ticket.awaiting = { step: 'create_ad_confirm', requestedBy: interaction.user.id };
+        try { delete ticket.awaiting; } catch (e) {}
         saveDB();
         
         // Add the tutor (ticket.userId) to the selected subject
@@ -719,13 +699,8 @@ ${String(err && (err.stack || err))}`;
         }
         saveDB();
         
-        // Ask if staff wants to create an ad for this tutor
-        const yesBtn = new ButtonBuilder().setCustomId(`mm_create_ad|${channelId}|yes`).setLabel('✅ Yes, Create Ad').setStyle(ButtonStyle.Success);
-        const noBtn = new ButtonBuilder().setCustomId(`mm_create_ad|${channelId}|no`).setLabel('❌ No, Close Ticket').setStyle(ButtonStyle.Danger);
-        const contactBtn = new ButtonBuilder().setCustomId(`mm_set_contact|${channelId}`).setLabel('📱 Set Contact Info').setStyle(ButtonStyle.Secondary);
-        const row = new ActionRowBuilder().addComponents(yesBtn, noBtn, contactBtn);
-        
-        await interaction.channel.send({ content: `Tutor <@${ticket.userId}> has been added for **${selectedSubject}**.\n\nWould you like to create an ad for this tutor?`, components: [row] }).catch(() => {});
+        await interaction.channel.send({ content: 'Tutor added for subject. Closing ticket...' }).catch(() => {});
+        await closeTicket(ticket, `${interaction.user.tag} (staff)`);
         return;
       }
 
@@ -806,14 +781,6 @@ ${String(err && (err.stack || err))}`;
             new StringSelectMenuOptionBuilder().setLabel(s).setValue(s)
           );
           
-          // Add "Add New Subject" option at the end
-          subjectOptions.push(
-            new StringSelectMenuOptionBuilder()
-              .setLabel('➕ Add New Subject')
-              .setValue('__add_new__')
-              .setDescription('Create a new subject')
-          );
-          
           const subjectSelect = new StringSelectMenuBuilder()
             .setCustomId(`mm_subject_select|${channelId}`)
             .setPlaceholder('Select the subject for this tutor')
@@ -824,128 +791,6 @@ ${String(err && (err.stack || err))}`;
           await interaction.channel.send({ content: 'Please select the subject for this tutor:', components: [row] }).catch(() => {});
           return;
         }
-      }
-
-      // Set contact info button for accepted tutor (mm_set_contact|channelId)
-      if (custom.startsWith('mm_set_contact|')) {
-        const channelId = custom.split('|')[1];
-        const ticket = db.modmail.byChannel[channelId];
-        if (!ticket) return safeReply(interaction, { content: 'Ticket not found.', ephemeral: true });
-        if (!isStaff(interaction.member)) return safeReply(interaction, { content: 'Only staff can use this.', ephemeral: true });
-
-        const tutorUserId = ticket.userId;
-        db.tutorProfiles = db.tutorProfiles || {};
-        db.tutorProfiles[tutorUserId] = db.tutorProfiles[tutorUserId] || { addedAt: Date.now(), students: [], reviews: [], rating: { count: 0, avg: 0 }, notes: '' };
-        const profile = db.tutorProfiles[tutorUserId];
-
-        const modal = new ModalBuilder()
-          .setCustomId(`mm_contact_modal|${channelId}|${tutorUserId}`)
-          .setTitle('Set Tutor Contact Info');
-        const phoneInput = new TextInputBuilder()
-          .setCustomId('phone').setLabel('Phone Number').setStyle(TextInputStyle.Short)
-          .setRequired(false).setValue((profile.phoneNumber || '').substring(0, 100)).setPlaceholder('e.g. +1 234 567 890');
-        const dobInput = new TextInputBuilder()
-          .setCustomId('dob').setLabel('Date of Birth').setStyle(TextInputStyle.Short)
-          .setRequired(false).setValue((profile.dob || '').substring(0, 100)).setPlaceholder('e.g. YYYY-MM-DD');
-        modal.addComponents(new ActionRowBuilder().addComponents(phoneInput), new ActionRowBuilder().addComponents(dobInput));
-        try { await interaction.showModal(modal); } catch (err) {
-          console.warn('showModal mm_set_contact failed', err);
-          return safeReply(interaction, { content: 'Could not open contact info modal, try again.', ephemeral: true });
-        }
-        return;
-      }
-
-      // Close ticket after all ads are done (mm_close_after_ads|channelId)
-      if (custom.startsWith('mm_close_after_ads|')) {
-        const channelId = custom.split('|')[1];
-        const ticket = db.modmail.byChannel[channelId];
-        if (!ticket) return safeReply(interaction, { content: 'Ticket not found.', ephemeral: true });
-        if (!isStaff(interaction.member)) return safeReply(interaction, { content: 'Only staff can close.', ephemeral: true });
-        await interaction.deferUpdate().catch(() => {});
-        await interaction.channel.send('Closing ticket...').catch(() => {});
-        await closeTicket(ticket, `${interaction.user.tag} (staff)`);
-        return;
-      }
-
-      // Create ad buttons (mm_create_ad|channelId|yes/no)
-      if (custom.startsWith('mm_create_ad|')) {
-        const parts = custom.split('|');
-        const channelId = parts[1];
-        const decision = parts[2]; // 'yes' or 'no'
-        
-        const ticket = db.modmail.byChannel[channelId];
-        if (!ticket) return safeReply(interaction, { content: 'Ticket not found.', ephemeral: true });
-        if (!isStaff(interaction.member)) return safeReply(interaction, { content: 'Only staff can use this.', ephemeral: true });
-        
-        await interaction.deferUpdate().catch(() => {});
-        
-        if (decision === 'no') {
-          // Don't create ad, just close ticket
-          try { delete ticket.awaiting; } catch (e) {}
-          saveDB();
-          await interaction.channel.send('Closing ticket without creating an ad...').catch(() => {});
-          await closeTicket(ticket, `${interaction.user.tag} (staff)`);
-          return;
-        }
-        
-        if (decision === 'yes') {
-          // Ask for ad category level first, then open createad modal
-          // NOTE: CREATEAD_LEVEL_CHANNELS is defined here but not currently used by the
-          // ad-creation flow (the selected level is forwarded directly to the createad modal
-          // via open_createad_modal). The IDs below could not be automatically mapped to
-          // production server channels from the available JSON export; verify them manually
-          // against the production guild (1360708397850431488) if this block is re-activated.
-          const CREATEAD_LEVEL_CHANNELS = {
-            university: '1458552573999972586',
-            a_level: '1458552889130614814',
-            igcse: '1458552485433311323',
-            below_igcse: '1458552366508019956',
-            language: '1464287197560701162',
-            other: '1458552927454105832'
-          };
-          
-          const levelOptions = [
-            new StringSelectMenuOptionBuilder().setLabel('University').setValue('university'),
-            new StringSelectMenuOptionBuilder().setLabel('A Level').setValue('a_level'),
-            new StringSelectMenuOptionBuilder().setLabel('IGCSE').setValue('igcse'),
-            new StringSelectMenuOptionBuilder().setLabel('Below IGCSE').setValue('below_igcse'),
-            new StringSelectMenuOptionBuilder().setLabel('Language').setValue('language'),
-            new StringSelectMenuOptionBuilder().setLabel('Other').setValue('other')
-          ];
-          
-          const levelSelect = new StringSelectMenuBuilder()
-            .setCustomId(`mm_ad_level_select|${channelId}`)
-            .setPlaceholder('Select the ad category level')
-            .addOptions(levelOptions)
-            .setRequired(true);
-          
-          const row = new ActionRowBuilder().addComponents(levelSelect);
-          await interaction.channel.send({ content: 'Select the category level for the ad:', components: [row] }).catch(() => {});
-          return;
-        }
-      }
-
-      // Ad level selection for modmail (mm_ad_level_select|channelId)
-      if (interaction.isStringSelectMenu() && interaction.customId && interaction.customId.startsWith('mm_ad_level_select|')) {
-        const channelId = interaction.customId.split('|')[1];
-        const levelKey = interaction.values && interaction.values[0];
-        
-        const ticket = db.modmail.byChannel[channelId];
-        if (!ticket) return safeReply(interaction, { content: 'Ticket not found.', ephemeral: true });
-        if (!isStaff(interaction.member)) return safeReply(interaction, { content: 'Only staff can use this.', ephemeral: true });
-        
-        await interaction.deferUpdate().catch(() => {});
-        
-        // Store the level and open createad modal (same as the regular createad flow but with modmail origin)
-        ticket.adLevel = levelKey;
-        saveDB();
-        
-        const subjectKey = ticket.applicationSubject ? encodeURIComponent(ticket.applicationSubject) : 'other';
-        const btn = new ButtonBuilder().setCustomId(`open_createad_modal|${interaction.user.id}|${subjectKey}|modmail|${channelId}|${levelKey}`).setLabel('Open Create Ad').setStyle(ButtonStyle.Primary);
-        const row = new ActionRowBuilder().addComponents(btn);
-        
-        await interaction.channel.send({ content: `Click the button to open the create-ad modal for subject: **${ticket.applicationSubject || 'N/A'}**, category: **${levelKey}**. The ad will be posted to both find-a-tutor and the category channel.`, components: [row] }).catch(() => {});
-        return;
       }
 
     } catch (err) {
@@ -1260,76 +1105,6 @@ ${String(err && (err.stack || err))}`;
       console.warn('modmail DM-button handler error', e);
       await notifyStaff(e, { module: 'modmail.dmButtonHandler' });
       try { if (interaction && !interaction.replied) await safeReply(interaction, { content: 'Action failed', ephemeral: true }); } catch {}
-    }
-  });
-
-  // handle add subject modal submit
-  client.on('interactionCreate', async (interaction) => {
-    try {
-      if (!interaction.isModalSubmit()) return;
-      if (!interaction.customId) return;
-      
-      // Handle add new subject modal (mm_add_subject_modal|channelId)
-      if (interaction.customId.startsWith('mm_add_subject_modal|')) {
-        const channelId = interaction.customId.split('|')[1];
-        const ticket = db.modmail.byChannel[channelId];
-        if (!ticket) return safeReply(interaction, { content: 'Ticket not found.', ephemeral: true });
-        if (!isStaff(interaction.member)) return safeReply(interaction, { content: 'Only staff can add subjects.', ephemeral: true });
-        
-        await interaction.deferUpdate().catch(() => {});
-        
-        const newSubject = interaction.fields.getTextInputValue('mm_subject_name') || '';
-        if (!newSubject.trim()) {
-          await interaction.followUp({ content: 'Subject name cannot be empty.', ephemeral: true }).catch(() => {});
-          return;
-        }
-        
-        const subjectTrimmed = newSubject.trim();
-        
-        // Add the new subject to db.subjects if not already there
-        if (!db.subjects) db.subjects = [];
-        if (!db.subjects.includes(subjectTrimmed)) {
-          db.subjects.push(subjectTrimmed);
-        }
-        
-        // Add the tutor to this new subject
-        if (!db.subjectTutors) db.subjectTutors = {};
-        if (!db.subjectTutors[subjectTrimmed]) db.subjectTutors[subjectTrimmed] = [];
-        if (!db.subjectTutors[subjectTrimmed].includes(ticket.userId)) {
-          db.subjectTutors[subjectTrimmed].push(ticket.userId);
-        }
-        
-        // Update the ticket
-        ticket.applicationSubject = subjectTrimmed;
-        try { delete ticket.awaiting; } catch (e) {}
-        saveDB();
-        
-        await interaction.channel.send(`✅ New subject **${subjectTrimmed}** created and tutor <@${ticket.userId}> has been added. Closing ticket...`).catch(() => {});
-        await closeTicket(ticket, `${interaction.user.tag} (staff)`);
-        return;
-      }
-
-      // Handle set contact info modal (mm_contact_modal|channelId|tutorUserId)
-      if (interaction.customId.startsWith('mm_contact_modal|')) {
-        const parts = interaction.customId.split('|');
-        const channelId = parts[1];
-        const tutorUserId = parts[2];
-        if (!isStaff(interaction.member)) return safeReply(interaction, { content: 'Only staff can set tutor contact info.', ephemeral: true });
-
-        const phone = interaction.fields.getTextInputValue('phone') || '';
-        const dob = interaction.fields.getTextInputValue('dob') || '';
-
-        db.tutorProfiles = db.tutorProfiles || {};
-        db.tutorProfiles[tutorUserId] = db.tutorProfiles[tutorUserId] || { addedAt: Date.now(), students: [], reviews: [], rating: { count: 0, avg: 0 }, notes: '' };
-        db.tutorProfiles[tutorUserId].phoneNumber = phone;
-        db.tutorProfiles[tutorUserId].dob = dob;
-        saveDB();
-
-        return safeReply(interaction, { content: `Contact info saved for tutor <@${tutorUserId}>.`, ephemeral: true });
-      }
-    } catch (err) {
-      console.error('add subject modal error', err);
-      await notifyStaff(err, { module: 'modmail.addSubjectModal' });
     }
   });
 

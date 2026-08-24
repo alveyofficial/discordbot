@@ -325,24 +325,6 @@ const SERVER_ONLY_PERMS = [];   // rely on API-key-level access; no public read
  * cross-app lookups (e.g. the website can filter tutorProfiles by tutorId).
  */
 const COLLECTIONS = [
-  // ── Ads (shared with Website) ─────────────────────────────────────────────
-
-  {
-    id: COLLECTION_IDS.ads,
-    name: 'Ads',
-    permissions: PUBLIC_READ_PERMS,
-    // Website-facing ads collection (already exists in your Appwrite project).
-    // One document per ad; documentId = messageId from Discord.
-    attrs: async (cid) => {
-      await createStringAttr(cid, 'title', 256, true);
-      await createLongtextAttr(cid, 'body', true);
-      await createStringAttr(cid, 'status', 32, false);
-      await createLongtextAttr(cid, 'Source', true);
-      await createLongtextAttr(cid, 'messageId', false);
-      await createLongtextAttr(cid, 'createdBy', false);
-    },
-  },
-
   // ── Synced with Website ──────────────────────────────────────────────────
 
   {
@@ -442,45 +424,11 @@ const COLLECTIONS = [
   },
 
   {
-    id: COLLECTION_IDS.nextAdCodes,
-    name: 'Discord Ad Codes',
-    permissions: PUBLIC_READ_PERMS,
-    // Single document (id="all"): { igcse: 3, a_level: 1, … }
-    attrs: async (cid) => {
-      await createLongtextAttr(cid, 'data', true);
-    },
-  },
-
-  {
-    id: COLLECTION_IDS.createAds,
-    name: 'Discord Create Ads',
-    permissions: SERVER_ONLY_PERMS,
-    // One document per active ad; documentId = Discord messageId.
-    // data: JSON.stringify({ channelId, embed, adCode, tutorId, level, ... })
-    attrs: async (cid) => {
-      await createStringAttr(cid, 'entityId', 64, true);
-      await createLongtextAttr(cid, 'data', true);
-    },
-  },
-
-  {
     id: COLLECTION_IDS.nextTicketId,
     name: 'Discord Next Ticket Id',
     permissions: SERVER_ONLY_PERMS,
     // Single document (id="counter"): 123
     attrs: async (cid) => {
-      await createLongtextAttr(cid, 'data', true);
-    },
-  },
-
-  {
-    id: COLLECTION_IDS.archivedAds,
-    name: 'Discord Archived Ads',
-    permissions: SERVER_ONLY_PERMS,
-    // One document per archived ad; documentId = original Discord messageId.
-    // data: JSON.stringify({ embed, tutorId, level, adCode, archivedAt, ... })
-    attrs: async (cid) => {
-      await createStringAttr(cid, 'entityId', 64, true);
       await createLongtextAttr(cid, 'data', true);
     },
   },
@@ -557,18 +505,6 @@ const COLLECTIONS = [
     permissions: SERVER_ONLY_PERMS,
     // One document per ticket; documentId = ticketId.
     // data: JSON.stringify({ studentId, subject, channelId, … })
-    attrs: async (cid) => {
-      await createStringAttr(cid, 'entityId', 64, true);
-      await createLongtextAttr(cid, 'data', true);
-    },
-  },
-
-  {
-    id: COLLECTION_IDS.tempCreateAd,
-    name: 'Discord Temp Create Ad',
-    permissions: SERVER_ONLY_PERMS,
-    // One document per session; documentId = messageId.
-    // data: JSON.stringify({ userId, selectedTutorId, … })
     attrs: async (cid) => {
       await createStringAttr(cid, 'entityId', 64, true);
       await createLongtextAttr(cid, 'data', true);

@@ -18,9 +18,6 @@ export const DB_ID = process.env.APPWRITE_BOT_DB_ID || process.env.APPWRITE_DB_I
 
 // Bot-only collections (all read/write operations)
 export const COLLECTION_IDS = {
-  // Ads (bot copy, kept in sync with website ads via syncAdsCollection)
-  ads:                 'ads',
-
   // Operational bot data
   subjects:            'discordSubjects',
   subjectLevels:       'discordSubjectLevels',
@@ -31,10 +28,7 @@ export const COLLECTION_IDS = {
   reviewConfig:        'discordReviewConfig',
   modmail:             'discordModmail',
   initMessage:         'discordInitMessage',
-  nextAdCodes:         'discordAdCodes',
-  createAds:           'discordCreateAds',
   nextTicketId:        'discordNextTicketId',
-  archivedAds:         'discordArchivedAds',
   defaultEmbedColor:   'discordDefaultEmbedColor',
   sticky:              'discordSticky',
   aiChannel:           'discordAiChannel',
@@ -44,7 +38,6 @@ export const COLLECTION_IDS = {
   bumpLeaderboard:     'discordBumpLeaderboard',
   tickets:             'discordTickets',
   keywords:            'discordKeywords',
-  tempCreateAd:        'discordTempCreateAd',
   tempTutorAdd:        'discordTempTutorAdd',
   tempTutorRemove:     'discordTempTutorRemove',
 };

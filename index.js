@@ -72,7 +72,6 @@ app.listen(PORT, () => {
 
 
 import initModmail from './modmail.js';
-import initDemo from './demo.js';
 import initAIAssistant from './ai-assistant.js';
 
 
@@ -93,11 +92,7 @@ const {
   MODMAIL_CATEGORY_ID,
   MODMAIL_TRANSCRIPTS_CHANNEL_ID,
   BUMP_CHANNEL_ID, // Optional: Channel ID where bump tracking should listen (if not set, listens in all channels)
-  ADS_CHANNEL_ID,
-  ARCHIVED_ADS_CHANNEL_ID,
-  AI_CHANNEL_ID,
-  SYNC_SECRET,
-  SYNC_WEBHOOK_URL
+  AI_CHANNEL_ID
 } = process.env;
 
 const TUTORS_LOUNGE_CATEGORY_ID = '1429172429304889427';
@@ -119,34 +114,6 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-// --- CreateAd categorisation (posts to find-a-tutor AND a subject channel) ---
-// Dynamic discovery: channels are found at runtime by category name + subject prefix.
-// categoryId fields were removed because the previous values referenced a test server
-// (guild different from 1360708397850431488). Without a categoryId, findSubjectChannel()
-// falls back to searching the guild's channel cache by categoryName, which is reliable
-// as long as the categories exist on the production server with these exact names.
-// Legacy note: older deployments used /exportchannels to capture channel IDs.
-// and add the correct IDs here.
-const CREATEAD_LEVEL_CONFIG = {
-  igcse:       { categoryName: 'IGCSE Tutors',       prefix: 'ig-'        },
-  // 'asl-al-' is the server-defined prefix for A-Level subject channels (e.g. asl-al-maths)
-  a_level:     { categoryName: 'AS/A Level Tutors',  prefix: 'asl-al-'   },
-  below_igcse: { categoryName: 'Below IGCSE Tutors', prefix: ''           },
-  university:  { categoryName: 'University Tutors',  prefix: 'uni-'       },
-  language:    { categoryName: 'Language Tutors',    prefix: 'lang-'      },
-  test_prep:   { categoryName: 'Test Prep Tutors',   prefix: 'testprep-'  },
-  other:       { categoryName: 'Other Tutors',       prefix: '' },
-};
-const CREATEAD_LEVEL_LABELS = {
-  university: 'University',
-  a_level: 'A level',
-  igcse: 'IGCSE',
-  below_igcse: 'Below IGCSE',
-  language: 'Language',
-  test_prep: 'Test Prep',
-  other: 'Other'
-};
-
 const DATA_FILE = './data.json';
 let db = {
   nextTicketId: 1,
@@ -159,9 +126,6 @@ let db = {
   tickets: {},
   cooldowns: {},
   sticky: null, // { title, body, color, messageId }
-  createAds: {}, // map messageId -> { channelId, embed, adCode, tutorId, level, ... }
-  nextAdCodes: {}, // map levelKey -> next serial number (e.g. { igcse: 3, a_level: 1 })
-  archivedAds: {}, // map originalMessageId -> { embed, tutorId, level, adCode, archivedAt, archivedBy, reason }
   defaultEmbedColor: null,
   // Review system
   tutorProfiles: {}, // tutorId -> { addedAt, students: [userId,...], reviews: [], rating: {count,avg} }
@@ -261,6 +225,41 @@ function buildPaginatedSelectMenu({ baseCustomId, placeholder, options, page = 0
     .setRequired(required);
 }
 
+const SUBJECT_LEVEL_LABELS = {
+  igcse: 'IGCSE',
+  a_level: 'A Level',
+  university: 'University',
+  below_igcse: 'Below IGCSE',
+  language: 'Language',
+  test_prep: 'Test Prep',
+  other: 'Other'
+};
+
+function normalizeSubjectLevelKey(rawInput) {
+  const value = String(rawInput || '').toLowerCase().trim().replace(/[\s-]+/g, '_');
+  if (!value) return null;
+  if (['igcse', 'gcse', 'o_level', 'olevel'].includes(value)) return 'igcse';
+  if (['a_level', 'alevel', 'as_level', 'as_al', 'as/a_level', 'as/al'].includes(value)) return 'a_level';
+  if (['below_igcse', 'below_gcse', 'below'].includes(value)) return 'below_igcse';
+  if (['university', 'uni'].includes(value)) return 'university';
+  if (['language', 'languages'].includes(value)) return 'language';
+  if (['test_prep', 'testprep', 'exam_prep'].includes(value)) return 'test_prep';
+  if (value === 'other') return 'other';
+  return null;
+}
+
+function detectLevelFromSubject(subject) {
+  const text = String(subject || '').toLowerCase();
+  if (!text) return null;
+  if (/\b(igcse|gcse|o[-\s]?level)\b/.test(text)) return 'igcse';
+  if (/\b(as\/al|as\s*\/\s*a|a[-\s]?level|alevel)\b/.test(text)) return 'a_level';
+  if (/\b(university|uni|college)\b/.test(text)) return 'university';
+  if (/\b(below\s+(igcse|gcse)|primary|middle school)\b/.test(text)) return 'below_igcse';
+  if (/\b(language|english|arabic|french|german|spanish|mandarin|chinese|urdu|hindi|malay)\b/.test(text)) return 'language';
+  if (/\b(ielts|sat|act|toefl|test prep|exam prep)\b/.test(text)) return 'test_prep';
+  return null;
+}
+
 function getSubjectsForLevel(levelKey, { fallbackToAll = true } = {}) {
   const allSubjects = sortStringsCaseInsensitive(db.subjects || []);
   if (!levelKey) return allSubjects;
@@ -343,11 +342,22 @@ async function syncTutorsLoungeCategoryAccess() {
     const category = await guild.channels.fetch(TUTORS_LOUNGE_CATEGORY_ID).catch(() => null);
     if (!category || category.type !== ChannelType.GuildCategory) return;
 
+    // Pre-fetch tutor members so Discord.js can resolve their IDs from cache.
+    // Members who have left the guild are silently skipped.
+    const tutorIds = getAllTutorIds();
+    const resolvedTutorIds = (
+      await Promise.all(
+        tutorIds.map(userId =>
+          guild.members.fetch(userId).then(() => userId).catch(() => null)
+        )
+      )
+    ).filter(Boolean);
+
     const accessRoleIds = Array.from(new Set([MANAGER_ROLE_ID, ISOFUSIE_ROLE_ID].filter(Boolean).map(s => String(s).trim())));
     const overwrites = [
       { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
       ...accessRoleIds.map(rid => ({ id: rid, allow: [PermissionsBitField.Flags.ViewChannel] })),
-      ...getAllTutorIds().map(userId => ({ id: userId, allow: [PermissionsBitField.Flags.ViewChannel] }))
+      ...resolvedTutorIds.map(userId => ({ id: userId, allow: [PermissionsBitField.Flags.ViewChannel] }))
     ];
 
     await category.permissionOverwrites.set(overwrites);
@@ -507,216 +517,6 @@ async function createEnquiryTicketFromInteraction(interaction, { subject, select
   return { code, ticketChannel };
 }
 
-function getTutorIdsForLevel(levelKey) {
-  if (!levelKey) return getAllTutorIds();
-  const tutorIds = new Set();
-  for (const [subject, ids] of Object.entries(db.subjectTutors || {})) {
-    const storedLevel = db.subjectLevels && db.subjectLevels[subject];
-    const effectiveLevel = storedLevel || detectLevelFromSubject(subject) || 'other';
-    if (effectiveLevel !== levelKey) continue;
-    for (const id of ids || []) tutorIds.add(String(id));
-  }
-  return sortStringsCaseInsensitive(Array.from(tutorIds));
-}
-
-async function handleOpenCreateAdModal(interaction, { requester, rawSubjectInput = '', origin = null, originChannel = null, levelKeyFromModmail = null, selectedTutorId = null } = {}) {
-  let levelKey = normalizeCreateAdLevelKey(rawSubjectInput) || (levelKeyFromModmail ? normalizeCreateAdLevelKey(levelKeyFromModmail) : 'other');
-  if (String(interaction.user.id) !== String(requester) && !isStaff(interaction.member)) {
-    return interaction.reply({ content: 'Only the command invoker or staff may open this modal.', ephemeral: true }).catch(() => {});
-  }
-
-  try {
-    const subjectsForLevel = getSubjectsForLevel(levelKey);
-    if (subjectsForLevel.length === 0) {
-      return interaction.reply({ content: 'No subjects available for this level. Add subjects first with `/subject add`.', ephemeral: true }).catch(() => {});
-    }
-    const subjectExamples = subjectsForLevel.slice(0, 3).join(', ');
-    const resolved = resolveCanonicalSubject(rawSubjectInput, { levelKey, fallbackToAll: true });
-    const prefilledSubject = resolved.subject || rawSubjectInput || '';
-    const subjectInput = new TextInputBuilder()
-      .setCustomId('ad_subject')
-      .setLabel(clampLabel('Subject'))
-      .setStyle(TextInputStyle.Short)
-      .setRequired(true)
-      .setPlaceholder(clampLabel(subjectExamples ? `Type a subject, e.g. ${subjectExamples}` : 'Type the subject name', 100))
-      .setValue(String(prefilledSubject || '').substring(0, 100));
-    let tutorPrefill = '';
-    if (selectedTutorId) tutorPrefill = `<@${selectedTutorId}>`;
-    const tutorInput = new TextInputBuilder()
-      .setCustomId('ad_tutor')
-      .setLabel(clampLabel('Tutor (Optional)'))
-      .setStyle(TextInputStyle.Short)
-      .setRequired(false)
-      .setPlaceholder('Mention, user ID, username, or tag')
-      .setValue(tutorPrefill.substring(0, 100));
-
-    const subjectDetailsInput = new TextInputBuilder().setCustomId('ad_subject_details').setLabel(clampLabel('Subject Level & Codes')).setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(clampLabel('Subject Level: \nSubject codes: ', 1000));
-    const tutorDetailsInput = new TextInputBuilder().setCustomId('ad_tutor_details').setLabel(clampLabel('Tutor Details & Pricing')).setStyle(TextInputStyle.Paragraph).setRequired(true).setValue(clampLabel('Languages: \nClass Type: \nClass Duration: \nClasses/week: \nClasses/month: \nPrice per Class (USD) for Group classes: \nPrice per Class (USD) for 1-on-1 classes: \nTime zone:', 1000));
-    const optionalFieldsInput = new TextInputBuilder().setCustomId('ad_optional_fields').setLabel(clampLabel('Optional: Message, Testimonials, Payment, Color, Role')).setStyle(TextInputStyle.Paragraph).setRequired(false).setValue(clampLabel('Message from tutor:\nStudent Testimonials:\nPayment Terms: 100% upfront before classes begin\nColor: \nRole ID: ', 1000));
-
-    const modal = new ModalBuilder()
-      .setCustomId(`createad_modal|${interaction.id}|${levelKey}|${origin || ''}|${originChannel || ''}|${rawSubjectInput}`)
-      .setTitle('Create Ad Details')
-      .addComponents(
-        new ActionRowBuilder().addComponents(subjectInput),
-        new ActionRowBuilder().addComponents(tutorInput),
-        new ActionRowBuilder().addComponents(subjectDetailsInput),
-        new ActionRowBuilder().addComponents(tutorDetailsInput),
-        new ActionRowBuilder().addComponents(optionalFieldsInput)
-      );
-    await interaction.showModal(modal);
-  } catch (err) {
-    console.error('open_createad_modal failed', err);
-    try { notifyStaffError(err, 'open_createad_modal', interaction); } catch (e) {}
-    await interaction.reply({ content: 'Could not open ad creation modal, try again.', ephemeral: true }).catch(() => {});
-  }
-}
-
-function buildCreateAdShortDescription({ price = '', price1on1 = '', timezone = '', languages = '' } = {}) {
-  let message = '';
-  if (price && price1on1) {
-    message += `**Price (Group):** $${price}\n`;
-    message += `**Price (1-on-1):** $${price1on1}\n`;
-  } else if (price) {
-    message += `**Price:** $${price}\n`;
-  } else if (price1on1) {
-    message += `**Price (1-on-1):** $${price1on1}\n`;
-  }
-  if (timezone) message += `**Timezone:** ${timezone}\n`;
-  if (languages) message += `**Languages:** ${languages}\n`;
-  if (message) message += '\n';
-  message += `Click "View Full Details" below for more information, or "Talk to Tutors!" to start a conversation.`;
-  return message;
-}
-
-function buildEditAdFullDetailsPrefill(adData) {
-  const details = adData?.fullDetails || {};
-  const subjectLevel = details.subjectLevel && details.subjectLevel !== 'NA' ? details.subjectLevel : '';
-  const subjectCodes = details.subjectCodes && details.subjectCodes !== 'NA' ? details.subjectCodes : '';
-  const languages = details.languages && details.languages !== 'NA' ? details.languages : '';
-  const classType = details.classType && details.classType !== 'NA' ? details.classType : '';
-  const classDuration = details.classDuration && details.classDuration !== 'NA' ? details.classDuration : '';
-  const monthlySchedule = details.monthlySchedule && details.monthlySchedule !== 'NA' ? details.monthlySchedule : '';
-  const price = details.price || '';
-  const price1on1 = details.price1on1 || '';
-  const timezone = details.timezone && details.timezone !== 'NA' ? details.timezone : '';
-  const tutorMessage = details.tutorMessage && details.tutorMessage !== 'NA' ? details.tutorMessage : '';
-  const testimonials = details.testimonials && details.testimonials !== 'NA' ? details.testimonials : '';
-  const paymentTerms = details.paymentTerms || '100% upfront before classes begin';
-
-  return {
-    subjectDetails: `Subject Level: ${subjectLevel}\nSubject codes: ${subjectCodes}`,
-    tutorDetails: `Languages: ${languages}\nClass Type: ${classType}\nClass Duration: ${classDuration}\nMonthly Schedule: ${monthlySchedule}\nPrice per Class (USD) for Group classes: ${price}\nPrice per Class (USD) for 1-on-1 classes: ${price1on1}\nTime zone: ${timezone}`,
-    optionalFields: `Message from tutor:\n${tutorMessage}\nStudent Testimonials:\n${testimonials}\nPayment Terms: ${paymentTerms}`
-  };
-}
-
-function buildFullDetailsDescription(details, { includeFooter = false } = {}) {
-  const fullDetails = details || {};
-  let message = '';
-  message += `**Subject Level:** ${fullDetails.subjectLevel || 'N/A'}\n`;
-  message += `**Subject Codes:** ${fullDetails.subjectCodes || 'N/A'}\n\n`;
-
-  message += `**Languages:** ${fullDetails.languages || 'N/A'}\n`;
-  message += `**Class Type:** ${fullDetails.classType || 'N/A'}\n`;
-  message += `**Class Duration:** ${fullDetails.classDuration || 'N/A'}\n`;
-  message += `**Monthly Schedule:** ${fullDetails.monthlySchedule || 'N/A'}\n`;
-  if (fullDetails.price && fullDetails.price1on1) {
-    message += `**Price (Group):** $${fullDetails.price}\n`;
-    message += `**Price (1-on-1):** $${fullDetails.price1on1}\n`;
-  } else if (fullDetails.price) {
-    message += `**Price:** $${fullDetails.price}\n`;
-  } else if (fullDetails.price1on1) {
-    message += `**Price (1-on-1):** $${fullDetails.price1on1}\n`;
-  } else {
-    message += `**Price:** Contact for pricing\n`;
-  }
-  message += `**Timezone:** ${fullDetails.timezone || 'N/A'}\n\n`;
-
-  if (fullDetails.tutorMessage) {
-    message += `**Message from Tutor:**\n${fullDetails.tutorMessage}\n\n`;
-  }
-
-  if (fullDetails.testimonials) {
-    message += `**Student Testimonials:**\n${fullDetails.testimonials}\n\n`;
-  }
-
-  message += `**Payment Terms:** ${fullDetails.paymentTerms || '100% upfront before classes begin'}`;
-
-  if (includeFooter) {
-    const policiesChannelMention = TUTOR_POLICIES_CHANNEL_ID ? `<#${TUTOR_POLICIES_CHANNEL_ID}>` : '#tutors-link-policies';
-    message += `\n\nYou'll be connected with the tutor once the initial payment is confirmed.\n\n`;
-    message += `Make sure you follow ${policiesChannelMention} throughout the entire process.\n\n`;
-    message += `Once you're ready to pay, DM <@${client.user.id}> and you will be guided to the next steps.`;
-  }
-
-  return message;
-}
-
-function buildEditAdShortModal(messageId, source, { preTitle = '', preDesc = '', preColor = '', preRoleId = '' } = {}) {
-  const modal = new ModalBuilder().setCustomId(`editad_modal|${messageId}|${source}`).setTitle(`Edit ad ${messageId}`);
-  const subjectInput = new TextInputBuilder()
-    .setCustomId('edit_ad_subject')
-    .setLabel('Subject')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(true)
-    .setValue(String(preTitle || '').substring(0, 100))
-    .setPlaceholder(clampLabel(`Type the subject name${preTitle ? `, e.g. ${preTitle}` : ''}`, 100));
-  const msgInput = new TextInputBuilder().setCustomId('edit_ad_message').setLabel('Ad message').setStyle(TextInputStyle.Paragraph).setRequired(true).setValue((preDesc || '').substring(0, 4000));
-  const colorInput = new TextInputBuilder()
-    .setCustomId('edit_ad_color')
-    .setLabel('Optional embed color, example #ff0000')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setValue(preColor ? (preColor.startsWith('#') ? preColor : `#${preColor}`) : '');
-  const roleInput = new TextInputBuilder()
-    .setCustomId('edit_ad_role_mention')
-    .setLabel('Optional subject role mention')
-    .setStyle(TextInputStyle.Short)
-    .setRequired(false)
-    .setPlaceholder('Enter role ID to mention')
-    .setValue(preRoleId);
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(subjectInput),
-    new ActionRowBuilder().addComponents(msgInput),
-    new ActionRowBuilder().addComponents(colorInput),
-    new ActionRowBuilder().addComponents(roleInput)
-  );
-  return modal;
-}
-
-function buildEditAdFullModal(messageId, source, adData) {
-  const prefill = buildEditAdFullDetailsPrefill(adData);
-  const subjectDetailsInput = new TextInputBuilder()
-    .setCustomId('edit_full_subject_details')
-    .setLabel('Subject Level & Codes')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(true)
-    .setValue(clampLabel(prefill.subjectDetails, 1000));
-  const tutorDetailsInput = new TextInputBuilder()
-    .setCustomId('edit_full_tutor_details')
-    .setLabel('Tutor Details & Pricing')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(true)
-    .setValue(clampLabel(prefill.tutorDetails, 1000));
-  const optionalFieldsInput = new TextInputBuilder()
-    .setCustomId('edit_full_optional_fields')
-    .setLabel('Optional: Msg, Testimonials, Payment')
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setValue(clampLabel(prefill.optionalFields, 1000));
-
-  return new ModalBuilder()
-    .setCustomId(`editad_full_modal|${messageId}|${source}`)
-    .setTitle(`Edit full ad ${messageId}`)
-    .addComponents(
-      new ActionRowBuilder().addComponents(subjectDetailsInput),
-      new ActionRowBuilder().addComponents(tutorDetailsInput),
-      new ActionRowBuilder().addComponents(optionalFieldsInput)
-    );
-}
-
 function escapeRegExp(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -740,7 +540,7 @@ function buildSubjectSelectOptions(subjects) {
   }));
 }
 
-async function buildTutorSelectOptions(guild, tutorIds, { includeNoneOption = false, includeAdCodes = false, noneLabel = 'None', noneDescription = 'No selection' } = {}) {
+async function buildTutorSelectOptions(guild, tutorIds, { includeNoneOption = false, noneLabel = 'None', noneDescription = 'No selection' } = {}) {
   const options = [];
   if (includeNoneOption) {
     options.push({
@@ -769,10 +569,6 @@ async function buildTutorSelectOptions(guild, tutorIds, { includeNoneOption = fa
       }
     } catch (e) {
       // Best-effort label lookup only; fall back to stored IDs/usernames when Discord fetches fail.
-    }
-    if (includeAdCodes) {
-      const tutorAdCodes = Object.values(db.createAds || {}).filter(ad => ad.tutorId === tid && ad.adCode).map(ad => ad.adCode);
-      if (tutorAdCodes.length) description = `${tutorAdCodes.join(', ')}${description ? ' · ' + description : ''}`;
     }
     const option = {
       label: (label || `User ${tid}`).substring(0, 100),
@@ -832,226 +628,6 @@ async function buildCloseFlowComponents(guild, code, ticket, { tutorPage = 0, su
   ];
 }
 
-function normalizeCreateAdLevelKey(raw) {
-  const v = String(raw || '').trim().toLowerCase();
-  if (!v) return null;
-  if (CREATEAD_LEVEL_CONFIG[v]) return v;
-  // allow some common aliases
-  if (v === 'university' || v === 'uni') return 'university';
-  if (v === 'a level' || v === 'alevel' || v === 'a-level') return 'a_level';
-  if (v === 'below igcse' || v === 'below_igcse' || v === 'below-igcse') return 'below_igcse';
-  if (v === 'language' || v === 'lang') return 'language';
-  if (v === 'test prep' || v === 'test_prep' || v === 'testprep' || v === 'tp') return 'test_prep';
-  return null;
-}
-
-// Short prefix used in ad codes for each level (e.g. "IG-1", "AL-2")
-const AD_CODE_PREFIXES = {
-  igcse:       'IG',
-  a_level:     'AL',
-  university:  'Uni',
-  below_igcse: 'Bel',
-  language:    'Lang',
-  test_prep:   'TP',
-  other:       'Other',
-};
-
-/**
- * Generates a unique ad code for the given level key, e.g. "IG-1", "AL-3".
- * Increments the per-level counter in db.nextAdCodes and saves the DB.
- */
-function generateAdCode(levelKey) {
-  const key = levelKey || 'other';
-  if (!db.nextAdCodes) db.nextAdCodes = {};
-  const current = (db.nextAdCodes[key] || 0) + 1;
-  db.nextAdCodes[key] = current;
-  const prefix = AD_CODE_PREFIXES[key] || 'Ad';
-  return `${prefix}-${current}`;
-}
-
-/**
- * Resolves an ad code (e.g. "IG-1") to the associated tutor user ID, or null
- * if no matching ad is found.
- */
-function resolveAdCodeToTutorId(code) {
-  if (!code || !db.createAds) return null;
-  const normalised = String(code).trim().toUpperCase();
-  for (const data of Object.values(db.createAds)) {
-    if (data.adCode && String(data.adCode).toUpperCase() === normalised) {
-      return data.tutorId || null;
-    }
-  }
-  return null;
-}
-
-/**
- * Returns true if the given string looks like an ad code (known prefix + dash + digits).
- * Discord user IDs are purely numeric, so this safely distinguishes ad codes from user IDs.
- */
-function isAdCode(value) {
-  const knownPrefixes = Object.values(AD_CODE_PREFIXES).join('|');
-  return new RegExp(`^(?:${knownPrefixes})-\\d+$`, 'i').test(String(value || '').trim());
-}
-
-/**
- * Infers the CREATEAD_LEVEL_CONFIG key from a subject name prefix when no
- * explicit levelKey is stored (e.g. for ads created before the level field
- * was introduced).  Returns null when the prefix is unrecognisable.
- */
-function detectLevelFromSubject(subjectName) {
-  const s = String(subjectName || '').toLowerCase().trimStart();
-  if (/^(igcse\/gcse|igcse\/o-level|igcse|gcse)/.test(s)) return 'igcse';
-  if (/^(as\/a\s+level|as\/al|a\s+level|a-level)/.test(s)) return 'a_level';
-  if (/^(below\s+igcse|below-igcse|below_igcse)/.test(s)) return 'below_igcse';
-  if (/^university/.test(s)) return 'university';
-  if (/^language/.test(s)) return 'language';
-  if (/^test\s*prep/.test(s)) return 'test_prep';
-  return null;
-}
-
-/**
- * Dynamically discovers a subject channel within the correct category for a
- * given level.  If a matching channel is found, grants ViewChannel to @everyone
- * to make it public.  Returns the channel object, or null if not found.
- *
- * When createIfMissing is true and no existing channel is found, a new text
- * channel (and category if needed) will be created using the level's prefix.
- *
- * Fallback strategy (tried in order):
- *  1. prefix + bare name in the configured category        (e.g. ig-maths)
- *  2. bare name only in the configured category            (e.g. mandarin-chinese)
- *  3. Re-detect level from subject name and retry 1 & 2   (handles missing level field)
- *  4. Walk every other level config as last resort         (only when createIfMissing=false)
- *  5. Create the channel in the correct category           (only when createIfMissing=true)
- */
-async function findSubjectChannel(guild, levelKey, subjectName, createIfMissing = false) {
-  // Inner helper: search one level config for the channel
-  const tryLevel = (key) => {
-    const config = CREATEAD_LEVEL_CONFIG[key];
-    if (!config) return null;
-
-    // Prefer lookup by hard-coded category ID; fall back to name-based search
-    const category = config.categoryId
-      ? guild.channels.cache.get(config.categoryId)
-      : guild.channels.cache.find(
-          c => c.type === ChannelType.GuildCategory &&
-               c.name.toLowerCase() === config.categoryName.toLowerCase()
-        );
-    if (!category) {
-      if (process.env.DEBUG_MIGRATEADS) console.debug(`[migrateads] category not found: "${config.categoryName}" (id=${config.categoryId || 'n/a'}) for level="${key}"`);
-      return null;
-    }
-
-    // Normalise subject: strip known level prefixes, lowercase, spaces→hyphens
-    const bare = subjectName
-      .replace(/^(igcse\/gcse|igcse\/o-level|igcse|as\/al|as\/a\s+level|a\s+level|a-level|below\s+igcse|below_igcse|university|language|test\s*prep)\s+/i, '')
-      .toLowerCase()
-      .replace(/\s+/g, '-');
-
-    const targetName = (config.prefix + bare).toLowerCase();
-
-    // Primary: prefix + bare name
-    let channel = guild.channels.cache.find(
-      c => c.parentId === category.id && c.name.toLowerCase() === targetName
-    );
-
-    // Fallback: bare name without prefix (e.g. channels that omit the standard prefix)
-    if (!channel && config.prefix) {
-      channel = guild.channels.cache.find(
-        c => c.parentId === category.id && c.name.toLowerCase() === bare
-      );
-    }
-
-    if (!channel) {
-      if (process.env.DEBUG_MIGRATEADS) console.debug(`[migrateads] channel not found: "${targetName}" (or bare "${bare}") in category "${config.categoryName}"`);
-    }
-    return channel || null;
-  };
-
-  // 1. Try the supplied levelKey first
-  let channel = tryLevel(levelKey);
-
-  // 2. If not found and levelKey was 'other' (or missing), try auto-detecting
-  //    the level from the subject name (handles ads without a stored level).
-  if (!channel) {
-    const detected = detectLevelFromSubject(subjectName);
-    if (detected && detected !== levelKey) {
-      channel = tryLevel(detected);
-    }
-  }
-
-  // 3. Last resort: walk every remaining level config.
-  // Skipped when createIfMissing=true so we never post to a wrong-category channel —
-  // instead we fall through to step 4 which creates the correct channel.
-  if (!channel && !createIfMissing) {
-    for (const k of Object.keys(CREATEAD_LEVEL_CONFIG)) {
-      if (k === levelKey) continue;
-      channel = tryLevel(k);
-      if (channel) break;
-    }
-  }
-
-  // 4. If still not found and createIfMissing is requested, create the channel
-  if (!channel && createIfMissing) {
-    const config = CREATEAD_LEVEL_CONFIG[levelKey];
-    if (config) {
-      try {
-        // Resolve the category: prefer the hard-coded ID, fall back to name search,
-        // and only create a new category as a last resort (for levels without an ID).
-        let category = config.categoryId
-          ? guild.channels.cache.get(config.categoryId)
-          : guild.channels.cache.find(
-              c => c.type === ChannelType.GuildCategory &&
-                   c.name.toLowerCase() === config.categoryName.toLowerCase()
-            );
-        if (!category && !config.categoryId) {
-          category = await guild.channels.create({
-            name: config.categoryName,
-            type: ChannelType.GuildCategory,
-          });
-          console.log(`findSubjectChannel: created category "${config.categoryName}"`);
-        }
-        if (!category) {
-          console.warn(`findSubjectChannel: category not found for level "${levelKey}" (id=${config.categoryId}), cannot create channel for subject "${subjectName}"`);
-        } else {
-          // Normalise subject name → channel name
-          const bare = subjectName
-            .replace(/^(igcse\/gcse|igcse\/o-level|igcse|as\/al|as\/a\s+level|a\s+level|a-level|below\s+igcse|below_igcse|university|language|test\s*prep)\s+/i, '')
-            .toLowerCase()
-            .replace(/\s+/g, '-')
-            .replace(/[^a-z0-9-]/g, '')  // strip Discord-invalid chars
-            .replace(/-{2,}/g, '-')      // collapse multiple hyphens
-            .replace(/^-|-$/g, '');      // trim leading/trailing hyphens
-
-          const channelName = (config.prefix + bare).substring(0, 100);
-
-          channel = await guild.channels.create({
-            name: channelName,
-            type: ChannelType.GuildText,
-            parent: category.id,
-            permissionOverwrites: [
-              { id: guild.roles.everyone, allow: [PermissionFlagsBits.ViewChannel] },
-            ],
-          });
-          console.log(`findSubjectChannel: created channel "#${channelName}" under "${config.categoryName}"`);
-        }
-      } catch (e) {
-        console.warn('findSubjectChannel: failed to create channel', e);
-      }
-    }
-  }
-
-  if (!channel) return null;
-
-  // Make the channel public by granting ViewChannel to @everyone
-  try {
-    await channel.permissionOverwrites.edit(guild.roles.everyone, { ViewChannel: true });
-  } catch (e) {
-    console.warn('findSubjectChannel: failed to update permissions', e);
-  }
-
-  return channel;
-}
 
 // Try to fetch a user but fail fast (timeout) to avoid interaction timeouts
 // NOTE: We avoid network fetches during modal construction to prevent interaction timeouts.
@@ -1095,15 +671,6 @@ if (db.reviewConfig && db.reviewConfig.delayDays && !db.reviewConfig.delaySecond
           if (db.initMessage && typeof db.initMessage === 'string' && db.initMessage.includes('#tutors-link-policies')) {
             db.initMessage = db.initMessage.split('#tutors-link-policies').join(policyMention);
             migrated = true;
-          }
-          if (db.createAds && typeof db.createAds === 'object') {
-            for (const key of Object.keys(db.createAds)) {
-              const entry = db.createAds[key];
-              if (entry && entry.embed && typeof entry.embed.description === 'string' && entry.embed.description.includes('#tutors-link-policies')) {
-                entry.embed.description = entry.embed.description.split('#tutors-link-policies').join(policyMention);
-                migrated = true;
-              }
-            }
           }
         }
         if (migrated) saveDB();
@@ -1190,47 +757,6 @@ async function initializeDB() {
 }
 
 await initializeDB();
-
-// Helper: build a standardized archive embed for an ad entry
-function buildArchiveEmbed(adData, msgId, reason, archivedBy) {
-  const subject = adData.embed?.title || 'Unknown Subject';
-  const level = CREATEAD_LEVEL_LABELS[adData.level] || adData.level || 'Unknown';
-  const tutorValue = archivedBy === 'system'
-    ? `<@${adData.tutorId}> (left server)`
-    : (adData.tutorId ? `<@${adData.tutorId}>` : '(no tutor assigned)');
-  const archiveDescription = adData.fullDetails
-    ? buildFullDetailsDescription(adData.fullDetails)
-    : (adData.embed?.description || '(no description)');
-  const descriptionChunks = splitMessage(archiveDescription, 4000);
-  const embedDescription = descriptionChunks.shift() || '(no description)';
-  const overflowMessages = [];
-  for (const chunk of descriptionChunks) {
-    overflowMessages.push(...splitMessage(chunk, 2000));
-  }
-  const embed = new EmbedBuilder()
-    .setTitle(`📦 Archived Ad: ${subject}`)
-    .setDescription(embedDescription)
-    .addFields(
-      { name: 'Ad Code', value: adData.adCode || '(none)', inline: true },
-      { name: 'Level', value: level, inline: true },
-      { name: 'Tutor', value: tutorValue, inline: true },
-      { name: 'Reason', value: reason },
-      { name: 'Original Message ID', value: msgId }
-    )
-    .setTimestamp();
-  if (overflowMessages.length) {
-    embed.setFooter({ text: 'Full archived ad details continue in the next message(s).' });
-  }
-  if (adData.embed?.color) { try { embed.setColor(adData.embed.color); } catch (e) {} }
-  return { embed, overflowMessages };
-}
-
-// Helper: get student IDs currently assigned to a given tutor
-function getStudentsAssignedToTutor(tutorId) {
-  return Object.entries(db.studentAssignments || {})
-    .filter(([, asg]) => asg && String(asg.tutorId) === String(tutorId))
-    .map(([studentId]) => studentId);
-}
 
 function normalizeKeywordAutomations(rawEntries) {
   const list = Array.isArray(rawEntries) ? rawEntries : [];
@@ -1346,7 +872,6 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildVoiceStates
   ],
   partials: [Partials.Channel]
 });
@@ -1456,44 +981,7 @@ async function sendReviewPage(tutorId, page = 0, sortMethod = 'newest') {
 
 // Helper function to update review threads for a tutor when new reviews are added
 async function updateReviewThreadsForTutor(tutorId) {
-    try {
-        // Find all ads that have review threads for this tutor
-        for (const [messageId, adData] of Object.entries(db.createAds || {})) {
-            if (adData.tutorId === tutorId && adData.reviewThreadId) {
-                try {
-                    const channel = await client.channels.fetch(adData.channelId).catch(() => null);
-                    if (!channel) continue;
-                    
-                    const thread = await channel.threads.fetch(adData.reviewThreadId).catch(() => null);
-                    if (!thread) continue;
-                    
-                    // Get the first message in the thread (the reviews embed)
-                    const messages = await thread.messages.fetch({ limit: 1 }).catch(() => null);
-                    if (messages && messages.size > 0) {
-                        const firstMessage = messages.first();
-                        const messageData = await sendReviewPage(tutorId, 0, 'newest');
-                        if (messageData && firstMessage) {
-                            await firstMessage.edit(messageData).catch((err) => {
-                                console.warn('Failed to update review thread message', err);
-                            });
-                        }
-                    } else {
-                        // No message yet, send a new one
-                        const messageData = await sendReviewPage(tutorId, 0, 'newest');
-                        if (messageData) {
-                            await thread.send(messageData).catch((err) => {
-                                console.warn('Failed to send review thread message', err);
-                            });
-                        }
-                    }
-                } catch (e) {
-                    console.warn(`Failed to update review thread for ad ${messageId}`, e);
-                }
-            }
-        }
-    } catch (e) {
-        console.warn('updateReviewThreadsForTutor failed', e);
-    }
+    return null;
 }
 
 function generateTicketNumber() {
@@ -1643,16 +1131,6 @@ try {
 } catch (e) {
   console.warn('initAIAssistant threw', e);
   try { notifyStaffError(e, 'initAIAssistant'); } catch (err) { console.warn('notify staff failed for initAIAssistant', err); }
-}
-
-// register demo module
-try {
-  // Make db accessible to demo.js
-  global.demoDB = db;
-  initDemo(client);
-} catch (e) {
-  console.warn('initDemo threw', e);
-  try { notifyStaffError(e, 'initDemo'); } catch (err) { console.warn('notify staff failed for initDemo', err); }
 }
 
 // In-memory map: tutorThreadId -> error Message object (one error message at a time per thread)
@@ -1882,21 +1360,6 @@ async function registerCommands() {
       default_member_permissions: PermissionFlagsBits.ManageMessages.toString()
     },
     {
-      name: 'ad',
-      description: 'Create, edit, or delete tutor ads',
-      options: [
-        { name: 'create', description: 'Create a tutor ad', type: 1 },
-        { name: 'edit', description: 'Edit an existing tutor ad', type: 1, options: [
-          { name: 'messageid', description: 'Message id of the ad to edit', type: 3, required: true }
-        ] },
-        { name: 'delete', description: 'Delete an ad and archive it', type: 1, options: [
-          { name: 'messageid', description: 'Message id of the ad to delete (from find-a-tutor)', type: 3, required: true },
-          { name: 'reason', description: 'Reason for deleting the ad (sent to tutor/students)', type: 3, required: false }
-        ] }
-      ],
-      default_member_permissions: PermissionFlagsBits.ManageMessages.toString()
-    },
-    {
       name: 'sticky',
       description: 'Create or edit the sticky welcome message in find-a-tutor',
       default_member_permissions: PermissionFlagsBits.ManageMessages.toString()
@@ -1955,12 +1418,6 @@ async function registerCommands() {
         { name: 'seconds', type: 3, required: true, description: 'Number of seconds to wait before sending review reminder' }
       ], default_member_permissions: PermissionFlagsBits.ManageMessages.toString()
     },
-    { name: 'startdemo', description: 'Start a demo recording session', options: [
-        { name: 'student', type: 6, required: true, description: 'The student user' },
-        { name: 'title', type: 3, required: true, description: 'Recording title' }
-      ], default_member_permissions: PermissionFlagsBits.ManageMessages.toString()
-    },
-    { name: 'authentication', description: 'Generate authentication code for webapp access (staff only)', default_member_permissions: PermissionFlagsBits.ManageMessages.toString() },
     {
       name: 'modmailmap',
       description: 'Set the modmail category for a purpose using a category picker',
@@ -2028,12 +1485,6 @@ process.on('uncaughtException', (err) => {
 // - /ad create modal has optional tutor text field (resolveTutorInput) and thread creation is supported in ad modal submit
 client.on('interactionCreate', async (interaction) => {
   try {
-    // Skip commands handled by demo.js immediately to prevent conflicts
-    if (interaction.isChatInputCommand() && 
-        (interaction.commandName === 'startdemo' || interaction.commandName === 'authentication')) {
-      return; // Let demo.js handle these
-    }
-
     // Autocomplete handlers
     if (interaction.isAutocomplete() && interaction.commandName === 'enquire') {
       const focused = interaction.options.getFocused();
@@ -2092,134 +1543,6 @@ client.on('interactionCreate', async (interaction) => {
     // BUTTONS
     if (interaction.isButton()) {
       const custom = interaction.customId || '';
-
-      if (custom.startsWith('editad_choice|')) {
-        const parts = custom.split('|');
-        const messageId = parts[1];
-        const source = parts[2] || 'find';
-        const mode = parts[3] || 'short';
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can edit ads.', ephemeral: true }).catch(() => {});
-
-        const adData = source === 'find'
-          ? db.createAds[messageId] || null
-          : Object.values(db.createAds || {}).find(data => data && data.categoryMessageId === messageId) || null;
-
-        if (!adData) return interaction.reply({ content: 'Could not find ad data for this post.', ephemeral: true }).catch(() => {});
-
-        const preTitle = interaction.message?.embeds?.[0]?.title || adData.embed?.title || '';
-        const preDesc = interaction.message?.embeds?.[0]?.description || adData.embed?.description || '';
-        const preColor = adData.embed?.color || '';
-        let preRoleId = '';
-        const currentContent = interaction.message?.content || '';
-        const roleMatch = currentContent.match(/<@&(\d+)>/);
-        if (roleMatch) preRoleId = roleMatch[1];
-
-        try {
-          if (mode === 'full') {
-            if (!adData.fullDetails) {
-              return interaction.reply({ content: 'This ad does not have saved full-details data to edit yet.', ephemeral: true }).catch(() => {});
-            }
-            await interaction.showModal(buildEditAdFullModal(messageId, source, adData));
-          } else {
-            await interaction.showModal(buildEditAdShortModal(messageId, source, { preTitle, preDesc, preColor, preRoleId }));
-          }
-        } catch (err) {
-          console.error('showModal editad choice failed', err);
-          try { notifyStaffError(err, 'showModal editad choice', interaction); } catch (e) {}
-          return interaction.reply({ content: 'Could not open edit modal, try again.', ephemeral: true }).catch(() => {});
-        }
-        return;
-      }
-
-      // Handle View Full Details button
-      if (custom.startsWith('view_full_details|')) {
-        // customId format:
-        //   new: view_full_details|<adCode>  (e.g. view_full_details|IG-1)
-        //   old: view_full_details|<subject> (legacy buttons before adCode migration)
-        const identifier = custom.slice('view_full_details|'.length);
-        
-        // Find the ad: prefer lookup by adCode (new format), fall back to subject title (old format)
-        let adData = null;
-        if (isAdCode(identifier)) {
-          // New format — fast lookup by adCode
-          for (const data of Object.values(db.createAds || {})) {
-            if (data.adCode === identifier) { adData = data; break; }
-          }
-        }
-        if (!adData) {
-          // Backward-compat: search by embed title (subject name); prefer entries with fullDetails
-          for (const data of Object.values(db.createAds || {})) {
-            if (data.embed && data.embed.title === identifier) {
-              if (!adData || (!adData.fullDetails && data.fullDetails)) adData = data;
-            }
-          }
-        }
-        
-        // Derive a display subject from whatever we found
-        const subject = (adData && adData.embed && adData.embed.title) || identifier;
-        
-        if (!adData || !adData.fullDetails) {
-          return interaction.reply({ content: 'Could not find ad details. Please try again later.', ephemeral: true }).catch(() => {});
-        }
-
-        const detailsMessage = buildFullDetailsDescription(adData.fullDetails, { includeFooter: true });
-        
-        const detailsEmbed = new EmbedBuilder()
-          .setTitle(`${subject} - Full Details`)
-          .setDescription(detailsMessage)
-          .setTimestamp();
-        
-        if (adData.adCode) detailsEmbed.setFooter({ text: `Ad Code: ${adData.adCode}` });
-        
-        if (adData.embed && adData.embed.color) {
-          try { detailsEmbed.setColor(adData.embed.color); } catch (e) {}
-        }
-        
-        // Create button row with Talk to Tutors button for ephemeral message
-        const detailsRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`ad_enquire|${subject}|${adData.adCode || ''}`).setLabel('Talk to Tutors!').setStyle(ButtonStyle.Success)
-        );
-        
-        return interaction.reply({ embeds: [detailsEmbed], components: [detailsRow], ephemeral: true }).catch(() => {});
-      }
-
-      if (custom.startsWith('ad_enquire|')) {
-        // ad_enquire format: ad_enquire|<subject>|<optional adMessageId or adCode>
-        const parts = custom.split('|');
-        const subject = parts[1];
-        const identifier = parts[2] || null;
-        // Resolve selected tutor if the button referenced a specific ad
-        let selectedTutorId = null;
-        try {
-          if (identifier) {
-            // If identifier looks like a message id and we have a matching createAds entry
-            if (/^\d+$/.test(identifier) && db.createAds && db.createAds[identifier]) {
-              selectedTutorId = db.createAds[identifier].tutorId || null;
-            } else if (isAdCode(identifier)) {
-              selectedTutorId = resolveAdCodeToTutorId(identifier);
-            }
-          }
-        } catch (e) { console.warn('ad_enquire tutor resolution failed', e); }
-        await createEnquiryTicketFromInteraction(interaction, {
-          subject,
-          selectedTutorId,
-          source: 'ad_enquire',
-          creatingMessage: `Creating ticket for ${subject}...`,
-          successVerb: 'See'
-        });
-        return;
-      }
-      // Button to open the create-ad modal after usernames were resolved
-      if (custom && custom.startsWith('open_createad_modal|')) {
-        const parts = custom.split('|');
-        const requester = parts[1];
-        const rawSubjectInput = parts[2] || '';
-        const origin = parts[3] || null;
-        const originChannel = parts[4] || null;
-        const levelKeyFromModmail = parts[5] || null; // For modmail: level is pre-selected
-        await handleOpenCreateAdModal(interaction, { requester, rawSubjectInput, origin, originChannel, levelKeyFromModmail });
-        return;
-      }
 
             // Leave a review button
       if (custom.startsWith('review_start|')) {
@@ -2784,598 +2107,6 @@ client.on('interactionCreate', async (interaction) => {
                   return interaction.reply({ content: 'Review text has been redacted and auto-approved.', ephemeral: true }).catch(() => {});
               }
 
-      // createad modal submit
-        if (interaction.customId && interaction.customId.startsWith('createad_modal|')) {
-          const parts = interaction.customId.split('|');
-          const interactionId = parts[1];
-          const levelKey = normalizeCreateAdLevelKey(parts[2]) || 'other';
-          const origin = parts[3] || null;
-          const originChannel = parts[4] || null;
-          const subjectKeyFromModal = parts[5] || null;
-            
-            if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can create ads.', ephemeral: true }).catch(() => {});
-
-            // Defer reply immediately to prevent interaction timeout
-            await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-            const subjectInput = interaction.fields.getTextInputValue('ad_subject') || '';
-            const subjectResolution = resolveCanonicalSubject(subjectInput, { levelKey, fallbackToAll: true });
-            const subject = subjectResolution.subject;
-            if (!subject || !(db.subjects || []).includes(subject)) {
-                return interaction.editReply({ content: formatSubjectResolutionError(subjectInput, subjectResolution.suggestions) }).catch(() => {});
-            }
-            
-            // Get tutor from text input in modal
-            let selectedTutorId = null;
-            const tutorInput = interaction.fields.getTextInputValue('ad_tutor') || '';
-            if (tutorInput.trim()) {
-                const tutorResolution = resolveTutorInput(tutorInput);
-                if (!tutorResolution.tutorId) {
-                    return interaction.editReply({ content: formatTutorResolutionError(tutorInput, tutorResolution.suggestions) }).catch(() => {});
-                }
-                selectedTutorId = tutorResolution.tutorId;
-            }
-
-            // Get all template fields (parsed from combined inputs)
-            const subjectDetails = interaction.fields.getTextInputValue('ad_subject_details') || '';
-            const tutorDetails = interaction.fields.getTextInputValue('ad_tutor_details') || '';
-            const optionalFields = interaction.fields.getTextInputValue('ad_optional_fields') || '';
-            
-            // Parse subject details
-            let subjectLevel = '';
-            let subjectCodes = '';
-            if (subjectDetails) {
-                // Use [ \t]* (not \s*) to avoid consuming newlines, which would cause the
-                // next field's label to be captured as this field's value when the field is empty.
-                const levelMatch = subjectDetails.match(/Subject Level:[ \t]*(.+?)(?:\n|$)/i);
-                const codesMatch = subjectDetails.match(/Subject codes?:[ \t]*(.+?)(?:\n|$)/i);
-                subjectLevel = levelMatch ? levelMatch[1].trim() : '';
-                subjectCodes = codesMatch ? codesMatch[1].trim() : '';
-            }
-            
-            // Parse tutor details
-            let languages = '';
-            let classType = '';
-            let classDuration = '';
-            let monthlySchedule = '';
-            let price = '';
-            let price1on1 = '';
-            let timezone = '';
-            if (tutorDetails) {
-              // Use [ \t]* (not \s*) to avoid consuming newlines, which would cause the
-              // next field's label to be captured as this field's value when the field is empty.
-              const langMatch = tutorDetails.match(/Languages?:[ \t]*(.+?)(?:\n|$)/i);
-              const typeMatch = tutorDetails.match(/Class Type:[ \t]*(.+?)(?:\n|$)/i);
-              const durationMatch = tutorDetails.match(/Class Duration:[ \t]*(.+?)(?:\n|$)/i);
-              const weekMatch = tutorDetails.match(/Classes(?:\/| per )week:[ \t]*(.+?)(?:\n|$)/i);
-              const monthMatch = tutorDetails.match(/Classes(?:\/| per )month:[ \t]*(.+?)(?:\n|$)/i);
-              // Specific matches for group and 1-on-1 prices
-              const priceGroupMatch = tutorDetails.match(/Price per Class[^:\n]*Group[^:\n]*:[ \t]*(.+?)(?:\n|$)/i);
-              const price1on1Match = tutorDetails.match(/Price per Class[^:\n]*1[-\s–]on[-\s–]1[^:\n]*:[ \t]*(.+?)(?:\n|$)/i);
-              // Backward-compat: generic "Price per Class" for ads without the Group/1-on-1 labels
-              const priceGenericMatch = (!priceGroupMatch && !price1on1Match) ? tutorDetails.match(/Price per Class[^:\n]*:[ \t]*(.+?)(?:\n|$)/i) : null;
-              const tzMatch = tutorDetails.match(/Time zone:[ \t]*(.+?)(?:\n|$)/i);
-              languages = langMatch ? langMatch[1].trim() : '';
-              classType = typeMatch ? typeMatch[1].trim() : '';
-              classDuration = durationMatch ? durationMatch[1].trim() : '';
-              const classesWeek = weekMatch ? weekMatch[1].trim() : '';
-              const classesMonth = monthMatch ? monthMatch[1].trim() : '';
-              if (classesWeek && classesMonth) {
-                monthlySchedule = `${classesWeek} classes/week = ${classesMonth} classes/month`;
-              } else if (classesWeek) {
-                monthlySchedule = `${classesWeek} classes/week`;
-              } else if (classesMonth) {
-                monthlySchedule = `${classesMonth} classes/month`;
-              } else {
-                const scheduleMatch = tutorDetails.match(/Monthly Schedule:[ \t]*(.+?)(?:\n|$)/i);
-                monthlySchedule = scheduleMatch ? scheduleMatch[1].trim() : '';
-              }
-              price = priceGroupMatch ? priceGroupMatch[1].trim() : (priceGenericMatch ? priceGenericMatch[1].trim() : '');
-              price1on1 = price1on1Match ? price1on1Match[1].trim() : '';
-              timezone = tzMatch ? tzMatch[1].trim() : '';
-            }
-            
-            // Parse optional fields (Tutor Message, Testimonials, Payment Terms, Color, Role)
-            let tutorMessage = '';
-            let testimonials = '';
-            let paymentTerms = '100% upfront before classes begin';
-            let colorVal = null;
-            let roleMention = null;
-            
-            if (optionalFields) {
-                // Use [ \t]* (not \s*) to avoid consuming newlines; the s-flag + trim() still
-                // captures multi-line content while returning empty string for unfilled fields.
-                // Parse tutor message
-                const tutorMsgMatch = optionalFields.match(/Message from tutor:[ \t]*(.+?)(?:\n|Student|Payment|Color|Role|$)/is);
-                if (tutorMsgMatch) tutorMessage = tutorMsgMatch[1].trim();
-                
-                // Parse testimonials
-                const testMatch = optionalFields.match(/Student Testimonials?:[ \t]*(.+?)(?:\n|Payment|Color|Role|$)/is);
-                if (testMatch) testimonials = testMatch[1].trim();
-                
-                // Parse payment terms
-                const paymentMatch = optionalFields.match(/Payment Terms?:[ \t]*(.+?)(?:\n|Color|Role|$)/is);
-                if (paymentMatch) paymentTerms = paymentMatch[1].trim();
-                
-                // Parse color
-                const colorMatch = optionalFields.match(/Color:\s*(#?[0-9a-fA-F]{6})/i);
-                if (colorMatch) {
-                    const raw = colorMatch[1].trim();
-                    if (/^#?[0-9a-fA-F]{6}$/.test(raw)) colorVal = raw.startsWith('#') ? raw : `#${raw}`;
-                }
-                
-                // Parse role
-                const roleMatch = optionalFields.match(/Role(?: ID)?:\s*(\d+)/i);
-                if (roleMatch) {
-                    const roleId = roleMatch[1].trim();
-                    if (/^\d+$/.test(roleId)) roleMention = `<@&${roleId}>`;
-                }
-            }
-
-            // Build concise message for main embed (subject shown as embed title).
-            // Level is intentionally omitted here because ads are categorised into their
-            // level-specific channels; it is still shown in "View Full Details".
-            // Only include non-empty fields to avoid messy blank lines.
-            const message = buildCreateAdShortDescription({ price, price1on1, timezone, languages });
-
-            // Generate a unique ad code (e.g. IG-1, AL-3) for this ad
-            const adCode = generateAdCode(levelKey);
-
-            // Store full details for ephemeral message.
-            // Non-optional text fields default to 'NA' when empty so the View Full Details
-            // display never shows blank or corrupted values.  Price fields stay as empty
-            // strings so the conditional pricing display logic (group vs 1-on-1 vs "Contact
-            // for pricing") continues to work correctly.
-            const fullDetailsMessage = {
-              subjectLevel: subjectLevel || 'NA',
-              subjectCodes: subjectCodes || 'NA',
-              languages: languages || 'NA',
-              classType: classType || 'NA',
-              classDuration: classDuration || 'NA',
-              monthlySchedule: monthlySchedule || 'NA',
-              price,
-              price1on1,
-              timezone: timezone || 'NA',
-              tutorMessage,
-              testimonials,
-              paymentTerms
-            };
-
-            const embed = new EmbedBuilder().setTitle(subject).setDescription(message).setTimestamp().setFooter({ text: `Ad Code: ${adCode}` });
-            if (colorVal) embed.setColor(colorVal);
-            else if (db.defaultEmbedColor) {
-                try { embed.setColor(db.defaultEmbedColor); } catch (e) {}
-            }
-
-            const row = new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`view_full_details|${adCode}`).setLabel('View Full Details').setStyle(ButtonStyle.Secondary),
-              new ButtonBuilder().setCustomId(`ad_enquire|${subject}`).setLabel('Talk to Tutors!').setStyle(ButtonStyle.Success)
-            );
-
-            const findCh = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-            if (!findCh) return interaction.editReply({ content: 'Find-a-tutor channel not found.' }).catch(() => {});
-
-            const messageContent = roleMention || undefined;
-            const sent = await findCh.send({ content: messageContent, embeds: [embed], components: [row] }).catch(err => { 
-                console.error('send createad failed', err); 
-                try { notifyStaffError(err, 'createad send', interaction); } catch (e) {} 
-                return null; 
-            });
-            
-            // Also post to the discovered (or newly created) subject channel within the matching category.
-            // createIfMissing=true ensures university/language/test_prep channels are auto-created.
-            let categorySent = null;
-            let categoryCh = null;
-            try {
-                categoryCh = await findSubjectChannel(interaction.guild, levelKey, subject, true);
-                if (categoryCh) {
-                    categorySent = await categoryCh.send({ content: messageContent, embeds: [embed], components: [row] }).catch(() => null);
-                }
-            } catch (e) {
-                console.warn('createad category post failed', e);
-                try { notifyStaffError(e, 'createad category post', interaction); } catch (err) {}
-            }
-            
-            if (sent) {
-                if (!db.createAds) db.createAds = {};
-                db.createAds[sent.id] = { 
-                    channelId: findCh.id, 
-                    embed: { title: subject, description: message, color: colorVal || db.defaultEmbedColor },
-                    tutorId: selectedTutorId,
-                    level: levelKey,
-                    adCode,
-                    categoryChannelId: categoryCh ? categoryCh.id : null,
-                    categoryMessageId: categorySent ? categorySent.id : null,
-                    fullDetails: fullDetailsMessage
-                };
-                saveDB();
-
-                // Update the enquiry button to include the message id so we can map back to this ad
-                try {
-                  const updatedRow = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setCustomId(`view_full_details|${adCode}`).setLabel('View Full Details').setStyle(ButtonStyle.Secondary),
-                    new ButtonBuilder().setCustomId(`ad_enquire|${subject}|${sent.id}`).setLabel('Talk to Tutors!').setStyle(ButtonStyle.Success)
-                  );
-                  await sent.edit({ components: [updatedRow] }).catch(() => {});
-                  if (categorySent) await categorySent.edit({ components: [updatedRow] }).catch(() => {});
-                } catch (e) { /* best-effort */ }
-
-                // Create review thread if a tutor was selected and has reviews
-                if (selectedTutorId) {
-                    try {
-                        const tutorProfile = db.tutorProfiles[selectedTutorId];
-                        if (tutorProfile && tutorProfile.reviews && tutorProfile.reviews.length > 0) {
-                            // Create a thread for reviews
-                            const threadName = `Reviews for ${subject} Tutor`;
-                            const thread = await sent.startThread({ 
-                                name: threadName.substring(0, 100), 
-                                autoArchiveDuration: 1440,
-                                reason: 'Tutor reviews'
-                            }).catch(() => null);
-                            
-                            if (thread) {
-                              // Store thread ID in createAds
-                              if (!db.createAds[sent.id]) db.createAds[sent.id] = {};
-                              db.createAds[sent.id].reviewThreadId = thread.id;
-                              saveDB();
-                              
-                              // Post initial reviews embed with pagination
-                              try {
-                                const messageData = await sendReviewPage(selectedTutorId, 0, 'newest');
-                                if (messageData) await thread.send(messageData).catch(() => {});
-                              } catch (e) {
-                                console.warn('Failed to post reviews to thread', e);
-                              }
-                            }
-                        }
-                    } catch (e) {
-                        console.warn('Failed to create review thread', e);
-                    }
-                }
-            }
-
-            // If this createad was opened from modmail, send a prompt for another ad instead of auto-closing
-            try {
-              if (origin === 'modmail' && originChannel) {
-                const modmailCh = await client.channels.fetch(originChannel).catch(() => null);
-                if (modmailCh) {
-                  const anotherBtn = new ButtonBuilder()
-                    .setCustomId(`mm_create_ad|${originChannel}|yes`)
-                    .setLabel('✅ Create Another Ad')
-                    .setStyle(ButtonStyle.Success);
-                  const doneBtn = new ButtonBuilder()
-                    .setCustomId(`mm_close_after_ads|${originChannel}`)
-                    .setLabel('✅ Done — Close Ticket')
-                    .setStyle(ButtonStyle.Primary);
-                  const row = new ActionRowBuilder().addComponents(anotherBtn, doneBtn);
-                  await modmailCh.send({ content: 'Ad created! Would you like to create another ad, or close the ticket?', components: [row] }).catch(() => {});
-                }
-              }
-            } catch (e) { console.warn('Failed to send post-createad modmail prompt', e); }
-
-            const levelLabel = CREATEAD_LEVEL_LABELS[levelKey] || 'Other';
-            return interaction.editReply({ content: categorySent ? `Ad posted in find-a-tutor and **${levelLabel}**.` : `Ad posted in find-a-tutor. (Could not post in **${levelLabel}** category channel.)` }).catch(() => {});
-        }
-
-      // editad modal submit
-      if (interaction.customId && interaction.customId.startsWith('editad_modal|')) {
-        const parts = interaction.customId.split('|');
-        const messageId = parts[1];
-        const source = parts[2] || 'find'; // 'find' or 'category'
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can edit ads.', ephemeral: true }).catch(() => {});
-        
-        // Defer reply immediately to prevent interaction timeout
-        await interaction.deferReply({ ephemeral: true }).catch(() => {});
-        
-        const messageText = interaction.fields.getTextInputValue('edit_ad_message') || '';
-        
-        const subjectInput = interaction.fields.getTextInputValue('edit_ad_subject') || '';
-        const subjectResolution = resolveCanonicalSubject(subjectInput, { fallbackToAll: true });
-        const subject = subjectResolution.subject;
-        if (!subject) {
-            return interaction.editReply({ content: formatSubjectResolutionError(subjectInput, subjectResolution.suggestions) }).catch(() => {});
-        }
-
-        // Find the ad data to get the paired message IDs
-        let adData = null;
-        let findMessageId = null;
-        let categoryMessageId = null;
-        
-        if (source === 'find') {
-          findMessageId = messageId;
-          // Get ad data from find message
-          adData = db.createAds[messageId];
-          if (adData && adData.categoryMessageId) {
-            categoryMessageId = adData.categoryMessageId;
-          }
-        } else {
-          categoryMessageId = messageId;
-          // Find ad data by categoryMessageId
-          for (const [msgId, data] of Object.entries(db.createAds || {})) {
-            if (data.categoryMessageId === messageId) {
-              adData = data;
-              findMessageId = msgId;
-              break;
-            }
-          }
-        }
-
-        // Get both channels
-        const findChannel = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-        let categoryChannel = null;
-        if (adData && adData.categoryChannelId) {
-          categoryChannel = await interaction.guild.channels.fetch(adData.categoryChannelId).catch(() => null);
-        }
-        
-        if (!findChannel && !categoryChannel) return interaction.editReply({ content: 'Could not find channels to update.' }).catch(() => {});
-
-        // Get optional color
-        let colorVal = null;
-        try {
-            const raw = interaction.fields.getTextInputValue('edit_ad_color') || '';
-            const cleaned = raw.trim();
-            if (cleaned && /^#?[0-9a-fA-F]{6}$/.test(cleaned)) {
-                colorVal = cleaned.startsWith('#') ? cleaned : `#${cleaned}`;
-            } else {
-                colorVal = adData?.embed?.color || db.defaultEmbedColor || null;
-            }
-        } catch (e) {
-            colorVal = adData?.embed?.color || db.defaultEmbedColor || null;
-        }
-
-        // Get optional role mention
-        let roleMention = null;
-        try {
-            const roleIdRaw = interaction.fields.getTextInputValue('edit_ad_role_mention') || '';
-            const roleId = roleIdRaw.trim();
-            if (roleId && /^\d+$/.test(roleId)) {
-                roleMention = `<@&${roleId}>`;
-            }
-        } catch (e) { /* optional field may not exist */ }
-
-        const embed = new EmbedBuilder().setTitle(subject).setDescription(messageText).setTimestamp();
-        if (colorVal) {
-          try { embed.setColor(String(colorVal)); } catch (e) {}
-        }
-
-        const messageContent = roleMention || undefined;
-
-        // Update find-a-tutor message if it exists
-        let findUpdateSuccess = false;
-        if (findChannel && findMessageId) {
-          try {
-            const findMsg = await findChannel.messages.fetch(findMessageId).catch(() => null);
-            if (findMsg) {
-              await findMsg.edit({ content: messageContent, embeds: [embed] }).catch(err => { console.error('edit ad in find channel failed', err); throw err; });
-              findUpdateSuccess = true;
-            }
-          } catch (e) {
-            console.warn('Failed to update find-a-tutor message', e);
-          }
-        }
-        
-        // Update category message if it exists
-        let categoryUpdateSuccess = false;
-        if (categoryChannel && categoryMessageId) {
-          try {
-            const categoryMsg = await categoryChannel.messages.fetch(categoryMessageId).catch(() => null);
-            if (categoryMsg) {
-              await categoryMsg.edit({ content: messageContent, embeds: [embed] }).catch(err => { console.error('edit ad in category channel failed', err); throw err; });
-              categoryUpdateSuccess = true;
-            }
-          } catch (e) {
-            console.warn('Failed to update category message', e);
-          }
-        }
-        
-        // Update database
-        if (findMessageId && adData) {
-          db.createAds[findMessageId] = { 
-            ...adData,
-            embed: { title: subject, description: messageText, color: colorVal } 
-          };
-          saveDB();
-        }
-        
-        let resultMsg = 'Ad updated';
-        if (findUpdateSuccess && categoryUpdateSuccess) {
-          resultMsg = 'Ad updated in both find-a-tutor and category channel.';
-        } else if (findUpdateSuccess) {
-          resultMsg = 'Ad updated in find-a-tutor. (Category channel update failed)';
-        } else if (categoryUpdateSuccess) {
-          resultMsg = 'Ad updated in category channel. (Find-a-tutor update failed)';
-        } else {
-          resultMsg = 'Failed to update ad in any channel.';
-        }
-        
-        return interaction.editReply({ content: resultMsg }).catch(() => {});
-      }
-
-      if (interaction.customId && interaction.customId.startsWith('editad_full_modal|')) {
-        const parts = interaction.customId.split('|');
-        const messageId = parts[1];
-        const source = parts[2] || 'find';
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can edit ads.', ephemeral: true }).catch(() => {});
-
-        await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-        let adData = null;
-        let findMessageId = null;
-        let categoryMessageId = null;
-
-        if (source === 'find') {
-          findMessageId = messageId;
-          adData = db.createAds[messageId];
-          if (adData && adData.categoryMessageId) categoryMessageId = adData.categoryMessageId;
-        } else {
-          categoryMessageId = messageId;
-          for (const [msgId, data] of Object.entries(db.createAds || {})) {
-            if (data.categoryMessageId === messageId) {
-              adData = data;
-              findMessageId = msgId;
-              break;
-            }
-          }
-        }
-
-        if (!adData) return interaction.editReply({ content: 'Could not find ad data for this post.' }).catch(() => {});
-
-        const findChannel = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-        let categoryChannel = null;
-        if (adData.categoryChannelId) {
-          categoryChannel = await interaction.guild.channels.fetch(adData.categoryChannelId).catch(() => null);
-        }
-
-        if (!findChannel && !categoryChannel) return interaction.editReply({ content: 'Could not find channels to update.' }).catch(() => {});
-
-        const subjectDetails = interaction.fields.getTextInputValue('edit_full_subject_details') || '';
-        const tutorDetails = interaction.fields.getTextInputValue('edit_full_tutor_details') || '';
-        const optionalFields = interaction.fields.getTextInputValue('edit_full_optional_fields') || '';
-
-        let subjectLevel = '';
-        let subjectCodes = '';
-        if (subjectDetails) {
-          const levelMatch = subjectDetails.match(/Subject Level:[ \t]*(.+?)(?:\n|$)/i);
-          const codesMatch = subjectDetails.match(/Subject codes?:[ \t]*(.+?)(?:\n|$)/i);
-          subjectLevel = levelMatch ? levelMatch[1].trim() : '';
-          subjectCodes = codesMatch ? codesMatch[1].trim() : '';
-        }
-
-        let languages = '';
-        let classType = '';
-        let classDuration = '';
-        let monthlySchedule = '';
-        let price = '';
-        let price1on1 = '';
-        let timezone = '';
-        if (tutorDetails) {
-          const langMatch = tutorDetails.match(/Languages?:[ \t]*(.+?)(?:\n|$)/i);
-          const typeMatch = tutorDetails.match(/Class Type:[ \t]*(.+?)(?:\n|$)/i);
-          const durationMatch = tutorDetails.match(/Class Duration:[ \t]*(.+?)(?:\n|$)/i);
-          const monthScheduleMatch = tutorDetails.match(/Monthly Schedule:[ \t]*(.+?)(?:\n|$)/i);
-          const weekMatch = tutorDetails.match(/Classes(?:\/| per )week:[ \t]*(.+?)(?:\n|$)/i);
-          const monthMatch = tutorDetails.match(/Classes(?:\/| per )month:[ \t]*(.+?)(?:\n|$)/i);
-          const priceGroupMatch = tutorDetails.match(/Price per Class[^:\n]*Group[^:\n]*:[ \t]*(.+?)(?:\n|$)/i);
-          const price1on1Match = tutorDetails.match(/Price per Class[^:\n]*1[-\s–]on[-\s–]1[^:\n]*:[ \t]*(.+?)(?:\n|$)/i);
-          const priceGenericMatch = (!priceGroupMatch && !price1on1Match) ? tutorDetails.match(/Price per Class[^:\n]*:[ \t]*(.+?)(?:\n|$)/i) : null;
-          const tzMatch = tutorDetails.match(/Time zone:[ \t]*(.+?)(?:\n|$)/i);
-          languages = langMatch ? langMatch[1].trim() : '';
-          classType = typeMatch ? typeMatch[1].trim() : '';
-          classDuration = durationMatch ? durationMatch[1].trim() : '';
-          const classesWeek = weekMatch ? weekMatch[1].trim() : '';
-          const classesMonth = monthMatch ? monthMatch[1].trim() : '';
-          if (monthScheduleMatch) {
-            monthlySchedule = monthScheduleMatch[1].trim();
-          } else if (classesWeek && classesMonth) {
-            monthlySchedule = `${classesWeek} classes/week = ${classesMonth} classes/month`;
-          } else if (classesWeek) {
-            monthlySchedule = `${classesWeek} classes/week`;
-          } else if (classesMonth) {
-            monthlySchedule = `${classesMonth} classes/month`;
-          }
-          price = priceGroupMatch ? priceGroupMatch[1].trim() : (priceGenericMatch ? priceGenericMatch[1].trim() : '');
-          price1on1 = price1on1Match ? price1on1Match[1].trim() : '';
-          timezone = tzMatch ? tzMatch[1].trim() : '';
-        }
-
-        let tutorMessage = '';
-        let testimonials = '';
-        let paymentTerms = '100% upfront before classes begin';
-        if (optionalFields) {
-          const tutorMsgMatch = optionalFields.match(/Message from tutor:[ \t]*(.+?)(?:\n|Student|Payment|$)/is);
-          if (tutorMsgMatch) tutorMessage = tutorMsgMatch[1].trim();
-          const testMatch = optionalFields.match(/Student Testimonials?:[ \t]*(.+?)(?:\n|Payment|$)/is);
-          if (testMatch) testimonials = testMatch[1].trim();
-          const paymentMatch = optionalFields.match(/Payment Terms?:[ \t]*(.+?)(?:\n|$)/is);
-          if (paymentMatch) paymentTerms = paymentMatch[1].trim();
-        }
-
-        const details = {
-          subjectLevel: subjectLevel || 'NA',
-          subjectCodes: subjectCodes || 'NA',
-          languages: languages || 'NA',
-          classType: classType || 'NA',
-          classDuration: classDuration || 'NA',
-          monthlySchedule: monthlySchedule || 'NA',
-          price,
-          price1on1,
-          timezone: timezone || 'NA',
-          tutorMessage,
-          testimonials,
-          paymentTerms
-        };
-
-        const subject = adData.embed?.title || 'Ad';
-        const colorVal = adData.embed?.color || db.defaultEmbedColor || null;
-        const shortDescription = buildCreateAdShortDescription({ price, price1on1, timezone, languages });
-        const embed = new EmbedBuilder().setTitle(subject).setDescription(shortDescription).setTimestamp();
-        if (colorVal) {
-          try { embed.setColor(String(colorVal)); } catch (e) {}
-        }
-
-        let messageContent = undefined;
-        try {
-          if (findMessageId && findChannel) {
-            const existingFindMsg = await findChannel.messages.fetch(findMessageId).catch(() => null);
-            if (existingFindMsg && existingFindMsg.content) messageContent = existingFindMsg.content || undefined;
-          }
-          if (!messageContent && categoryMessageId && categoryChannel) {
-            const existingCategoryMsg = await categoryChannel.messages.fetch(categoryMessageId).catch(() => null);
-            if (existingCategoryMsg && existingCategoryMsg.content) messageContent = existingCategoryMsg.content || undefined;
-          }
-        } catch (e) {
-          messageContent = undefined;
-        }
-
-        let findUpdateSuccess = false;
-        if (findChannel && findMessageId) {
-          try {
-            const findMsg = await findChannel.messages.fetch(findMessageId).catch(() => null);
-            if (findMsg) {
-              await findMsg.edit({ content: messageContent, embeds: [embed] }).catch(err => { console.error('edit full ad in find channel failed', err); throw err; });
-              findUpdateSuccess = true;
-            }
-          } catch (e) {
-            console.warn('Failed to update find-a-tutor message during full edit', e);
-          }
-        }
-
-        let categoryUpdateSuccess = false;
-        if (categoryChannel && categoryMessageId) {
-          try {
-            const categoryMsg = await categoryChannel.messages.fetch(categoryMessageId).catch(() => null);
-            if (categoryMsg) {
-              await categoryMsg.edit({ content: messageContent, embeds: [embed] }).catch(err => { console.error('edit full ad in category channel failed', err); throw err; });
-              categoryUpdateSuccess = true;
-            }
-          } catch (e) {
-            console.warn('Failed to update category message during full edit', e);
-          }
-        }
-
-        if (findMessageId && adData) {
-          db.createAds[findMessageId] = {
-            ...adData,
-            embed: { title: subject, description: shortDescription, color: colorVal },
-            fullDetails: details
-          };
-          saveDB();
-        }
-
-        let resultMsg = 'Detailed ad updated';
-        if (findUpdateSuccess && categoryUpdateSuccess) {
-          resultMsg = 'Detailed ad updated in both find-a-tutor and category channel.';
-        } else if (findUpdateSuccess) {
-          resultMsg = 'Detailed ad updated in find-a-tutor. (Category channel update failed)';
-        } else if (categoryUpdateSuccess) {
-          resultMsg = 'Detailed ad updated in category channel. (Find-a-tutor update failed)';
-        } else {
-          resultMsg = 'Failed to update detailed ad in any channel.';
-        }
-
-        return interaction.editReply({ content: resultMsg }).catch(() => {});
-      }
-
       // sticky modal submit
       if (interaction.customId === 'sticky_modal') {
         if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can set sticky.', ephemeral: true }).catch(() => {});
@@ -3687,166 +2418,6 @@ client.on('interactionCreate', async (interaction) => {
 
     // Select menus and other interaction types
     if (interaction.isStringSelectMenu()) {
-      // CreateAd level/category select (before opening the modal)
-      // customId: createad_level|<requesterUserId>
-      if (interaction.customId && interaction.customId.startsWith('createad_level|')) {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can do this.', ephemeral: true }).catch(() => {});
-        const parts = interaction.customId.split('|');
-        const requester = parts[1];
-        if (String(interaction.user.id) !== String(requester) && !isStaff(interaction.member)) {
-          return interaction.reply({ content: 'Only the command invoker or staff may set the category.', ephemeral: true }).catch(() => {});
-        }
-
-        const chosenRaw = interaction.values && interaction.values[0];
-        const levelKey = normalizeCreateAdLevelKey(chosenRaw);
-        if (!levelKey) {
-          return interaction.reply({ content: 'Invalid category selected.', ephemeral: true }).catch(() => {});
-        }
-
-        const subjectsForLevel = getSubjectsForLevel(levelKey);
-        if (!subjectsForLevel.length) {
-          return interaction.reply({ content: 'No subjects available for this level. Add subjects first with `/subject add`.', ephemeral: true }).catch(() => {});
-        }
-
-        const levelLabel = CREATEAD_LEVEL_LABELS[levelKey] || 'Selected';
-
-        // Keep the select menu so staff can change their mind
-        const levelOptions = [
-          new StringSelectMenuOptionBuilder().setLabel('University').setValue('university'),
-          new StringSelectMenuOptionBuilder().setLabel('A level').setValue('a_level'),
-          new StringSelectMenuOptionBuilder().setLabel('IGCSE').setValue('igcse'),
-          new StringSelectMenuOptionBuilder().setLabel('Below IGCSE').setValue('below_igcse'),
-          new StringSelectMenuOptionBuilder().setLabel('Language').setValue('language'),
-          new StringSelectMenuOptionBuilder().setLabel('Test Prep').setValue('test_prep'),
-          new StringSelectMenuOptionBuilder().setLabel('Other').setValue('other')
-        ].map(opt => {
-          try { if (opt.data?.value === levelKey) opt.setDefault(true); } catch (e) {}
-          return opt;
-        });
-
-        const levelSelect = new StringSelectMenuBuilder()
-          .setCustomId(`createad_level|${requester}`)
-          .setPlaceholder('Select subject level category')
-          .addOptions(levelOptions)
-          .setRequired(true);
-
-        const subjectOptions = buildSubjectSelectOptions(subjectsForLevel);
-        const subjectSelect = buildPaginatedSelectMenu({
-          baseCustomId: `createad_subject|${requester}|${levelKey}`,
-          placeholder: 'Select subject',
-          options: subjectOptions,
-          page: 0,
-          required: true
-        });
-
-        const rowSelect = new ActionRowBuilder().addComponents(levelSelect);
-        const rowSubject = new ActionRowBuilder().addComponents(subjectSelect);
-
-        try {
-          await interaction.update({
-            content: `Category selected: **${levelLabel}**. Now choose a subject.`,
-            components: [rowSelect, rowSubject]
-          });
-        } catch (e) {
-          try {
-            await interaction.reply({ content: `Category selected: **${levelLabel}**. Now choose a subject.`, components: [rowSelect, rowSubject], ephemeral: true });
-          } catch (err) {}
-        }
-        return;
-      }
-
-      // CreateAd subject select (after level chosen)
-      if (interaction.customId && interaction.customId.startsWith('createad_subject|')) {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can do this.', ephemeral: true }).catch(() => {});
-        const { baseCustomId, page } = parsePagedCustomId(interaction.customId);
-        const parts = baseCustomId.split('|');
-        const requester = parts[1];
-        const levelKey = parts[2];
-        if (String(interaction.user.id) !== String(requester) && !isStaff(interaction.member)) {
-          return interaction.reply({ content: 'Only the command invoker or staff may select the subject.', ephemeral: true }).catch(() => {});
-        }
-
-        const chosen = interaction.values && interaction.values[0];
-        if (!chosen) return interaction.reply({ content: 'No subject selected.', ephemeral: true }).catch(() => {});
-
-        if (isPagedNavigationValue(chosen)) {
-          const subjectsForLevel = getSubjectsForLevel(levelKey);
-          const subjectOptions = buildSubjectSelectOptions(subjectsForLevel);
-          const nextPage = getPagedNavigationTarget(page, chosen);
-          const subjectSelect = buildPaginatedSelectMenu({
-            baseCustomId: `createad_subject|${requester}|${levelKey}`,
-            placeholder: 'Select subject',
-            options: subjectOptions,
-            page: nextPage,
-            required: true
-          });
-          const rowSubject = new ActionRowBuilder().addComponents(subjectSelect);
-          const rows = Array.isArray(interaction.message?.components) && interaction.message.components.length > 0
-            ? [interaction.message.components[0], rowSubject]
-            : [rowSubject];
-          return interaction.update({ components: rows }).catch(() => {});
-        }
-
-        const subject = chosen;
-        const tutorIds = getTutorIdsForLevel(levelKey);
-        const tutorOptions = await buildTutorSelectOptions(interaction.guild, tutorIds, {
-          includeNoneOption: true,
-          noneLabel: 'No tutor selected',
-          noneDescription: 'Leave tutor unassigned'
-        });
-        const tutorSelect = buildPaginatedSelectMenu({
-          baseCustomId: `createad_tutor|${requester}|${levelKey}|${encodeURIComponent(subject)}`,
-          placeholder: 'Select tutor',
-          options: tutorOptions,
-          page: 0,
-          required: true
-        });
-        const rowTutor = new ActionRowBuilder().addComponents(tutorSelect);
-        return interaction.update({ content: `Subject selected: **${subject}**. Now select a tutor (or choose no tutor).`, components: [interaction.message.components[0], rowTutor] }).catch(() => {});
-      }
-
-      // CreateAd tutor select (after subject chosen)
-      if (interaction.customId && interaction.customId.startsWith('createad_tutor|')) {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can do this.', ephemeral: true }).catch(() => {});
-        const { baseCustomId, page } = parsePagedCustomId(interaction.customId);
-        const parts = baseCustomId.split('|');
-        const requester = parts[1];
-        const levelKey = parts[2];
-        const subject = decodeURIComponent(parts.slice(3).join('|'));
-        if (String(interaction.user.id) !== String(requester) && !isStaff(interaction.member)) {
-          return interaction.reply({ content: 'Only the command invoker or staff may select the tutor.', ephemeral: true }).catch(() => {});
-        }
-
-        const chosen = interaction.values && interaction.values[0];
-        if (!chosen) return interaction.reply({ content: 'No tutor selected.', ephemeral: true }).catch(() => {});
-
-        if (isPagedNavigationValue(chosen)) {
-          const tutorIds = getTutorIdsForLevel(levelKey);
-          const tutorOptions = await buildTutorSelectOptions(interaction.guild, tutorIds, {
-            includeNoneOption: true,
-            noneLabel: 'No tutor selected',
-            noneDescription: 'Leave tutor unassigned'
-          });
-          const nextPage = getPagedNavigationTarget(page, chosen);
-          const tutorSelect = buildPaginatedSelectMenu({
-            baseCustomId: `createad_tutor|${requester}|${levelKey}|${encodeURIComponent(subject)}`,
-            placeholder: 'Select tutor',
-            options: tutorOptions,
-            page: nextPage,
-            required: true
-          });
-          const rowTutor = new ActionRowBuilder().addComponents(tutorSelect);
-          const rows = Array.isArray(interaction.message?.components) && interaction.message.components.length > 0
-            ? [interaction.message.components[0], rowTutor]
-            : [rowTutor];
-          return interaction.update({ components: rows }).catch(() => {});
-        }
-
-        const selectedTutorId = chosen === 'none' ? null : chosen;
-        await handleOpenCreateAdModal(interaction, { requester, rawSubjectInput: subject, levelKeyFromModmail: levelKey, selectedTutorId });
-        return;
-      }
-
       // Tutor select handler for username-based flows (info / notes / remove)
       if (interaction.customId && interaction.customId.startsWith('tutor_select|')) {
         if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can do this.', ephemeral: true }).catch(() => {});
@@ -3863,7 +2434,7 @@ client.on('interactionCreate', async (interaction) => {
         if (isPagedNavigationValue(selected)) {
           const targetPage = getPagedNavigationTarget(page, selected);
           if (subAction === 'info') {
-            const options = await buildTutorSelectOptions(interaction.guild, getAllTutorIds(), { includeAdCodes: true });
+            const options = await buildTutorSelectOptions(interaction.guild, getAllTutorIds());
             const select = buildPaginatedSelectMenu({ baseCustomId, placeholder: 'Select a tutor to view info', options, page: targetPage });
             return interaction.update({ content: 'Select a tutor to view info:', components: [new ActionRowBuilder().addComponents(select)] }).catch(() => {});
           }
@@ -3892,7 +2463,6 @@ client.on('interactionCreate', async (interaction) => {
             const arr = db.subjectTutors[s] || [];
             if (arr.includes(userid)) subjects.push(s);
           }
-          const adCodesList = Object.values(db.createAds || {}).filter(a => a.tutorId === userid && a.adCode).map(a => a.adCode);
           const profile = db.tutorProfiles[userid] || { addedAt: null, students: [], reviews: [], rating: { count: 0, avg: 0 } };
           const addedAt = profile && profile.addedAt ? `<t:${Math.floor(profile.addedAt/1000)}:f>` : '(unknown)';
           let userTag = '(not in guild)';
@@ -3917,7 +2487,6 @@ client.on('interactionCreate', async (interaction) => {
           const dob = profile.dob || '(not set)';
           const lines = [
             `Tutor info for: ${userTag} (${userid})`,
-            `Ad code(s): ${adCodesList.length ? adCodesList.join(', ') : '(none)'}`,
             `Guild joined: ${joined}`,
             `Tutor added at: ${addedAt}`,
             `Subjects: ${subjects.length ? subjects.join(', ') : '(none)'}`,
@@ -4018,7 +2587,7 @@ client.on('interactionCreate', async (interaction) => {
           if (isPagedNavigationValue(selected)) {
             const targetPage = getPagedNavigationTarget(page, selected);
             const levelKey = db._tempTutorAdd[key]?.level || null;
-            const levelLabel = CREATEAD_LEVEL_LABELS[levelKey] || levelKey || 'Selected';
+            const levelLabel = SUBJECT_LEVEL_LABELS[levelKey] || levelKey || 'Selected';
             const subjectOptions = buildSubjectSelectOptions(getSubjectsForLevel(levelKey));
             const subjectSelect = buildPaginatedSelectMenu({
               baseCustomId,
@@ -4119,9 +2688,9 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId && interaction.customId.startsWith('tutor_add_level|')) {
         if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can do this.', ephemeral: true }).catch(() => {});
         const chosenRaw = interaction.values && interaction.values[0];
-        const levelKey = normalizeCreateAdLevelKey(chosenRaw);
+        const levelKey = normalizeSubjectLevelKey(chosenRaw);
         if (!levelKey) return interaction.reply({ content: 'Invalid level selected.', ephemeral: true }).catch(() => {});
-        const levelLabel = CREATEAD_LEVEL_LABELS[levelKey] || levelKey;
+        const levelLabel = SUBJECT_LEVEL_LABELS[levelKey] || levelKey;
         const key = interaction.user.id;
         db._tempTutorAdd = db._tempTutorAdd || {};
         db._tempTutorAdd[key] = db._tempTutorAdd[key] || { subject: null, userid: null };
@@ -4419,195 +2988,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      if (cmd === 'ad' || cmd === 'createad' || cmd === 'editad' || cmd === 'deletead') {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can manage ads.', ephemeral: true }).catch(() => {});
-
-        let adAction = null;
-        try { adAction = interaction.options.getSubcommand(false); } catch (e) {}
-        if (!adAction) {
-          adAction = cmd === 'createad' ? 'create' : cmd === 'editad' ? 'edit' : cmd === 'deletead' ? 'delete' : null;
-        }
-
-        if (adAction === 'create') {
-          // Acknowledge and fetch usernames into DB (may take time). We reply first to avoid "application did not respond".
-          try {
-            await interaction.reply({ content: 'Preparing ad modal and resolving tutor usernames, please wait...', ephemeral: true });
-          } catch (e) { /* ignore */ }
-
-          const allTutorIds = Array.from(new Set(Object.values(db.subjectTutors || {}).flat()));
-          const fetchPromises = allTutorIds.map(async (tid) => {
-            try {
-              if (!tid) return;
-              db.tutorProfiles = db.tutorProfiles || {};
-              db.tutorProfiles[tid] = db.tutorProfiles[tid] || { addedAt: null, students: [], reviews: [], rating: { count: 0, avg: 0 }, notes: '' };
-              if (db.tutorProfiles[tid].username) return;
-              const member = await interaction.guild.members.fetch(tid).catch(() => null);
-              if (member && member.user) {
-                db.tutorProfiles[tid].username = member.user.username;
-                db.tutorProfiles[tid].tag = member.user.tag;
-                return;
-              }
-              const user = await client.users.fetch(tid).catch(() => null);
-              if (user) {
-                db.tutorProfiles[tid].username = user.username;
-                db.tutorProfiles[tid].tag = user.tag;
-              }
-            } catch (e) { /* ignore per-user failures */ }
-          });
-
-          try {
-            await Promise.allSettled(fetchPromises);
-            saveDB();
-          } catch (e) { /* ignore */ }
-
-          await interaction.followUp({
-            content: 'Ready - select the subject level category, then click **Open ad form** and type the subject name.',
-            //components: buildCreateAdLevelFlowRows(interaction.user.id),
-            ephemeral: true
-          }).catch(() => {});
-          return;
-        }
-
-        if (adAction === 'edit') {
-          const messageId = interaction.options.getString('messageid', true);
-
-          let adData = null;
-          let foundInFindChannel = false;
-          let foundInCategoryChannel = false;
-
-          const findChannel = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-          let msg = null;
-          if (findChannel) {
-            msg = await findChannel.messages.fetch(messageId).catch(() => null);
-            if (msg) {
-              foundInFindChannel = true;
-              adData = db.createAds[messageId];
-            }
-          }
-
-          if (!msg) {
-            let matchedAdData = null;
-            for (const [msgId, data] of Object.entries(db.createAds || {})) {
-              if (data.categoryMessageId === messageId) {
-                matchedAdData = data;
-                break;
-              }
-            }
-
-            if (matchedAdData && matchedAdData.categoryChannelId) {
-              const categoryCh = await interaction.guild.channels.fetch(matchedAdData.categoryChannelId).catch(() => null);
-              if (categoryCh) {
-                const categoryMsg = await categoryCh.messages.fetch(messageId).catch(() => null);
-                if (categoryMsg) {
-                  msg = categoryMsg;
-                  foundInCategoryChannel = true;
-                  adData = matchedAdData;
-                }
-              }
-            }
-          }
-
-          if (!msg) return interaction.reply({ content: `Message ${messageId} not found in find-a-tutor or any category channel.`, ephemeral: true }).catch(() => {});
-
-          if ((db.subjects || []).length === 0) {
-            return interaction.reply({ content: 'No subjects available. Please add subjects first using /subject add', ephemeral: true }).catch(() => {});
-          }
-
-          const choiceRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`editad_choice|${messageId}|${foundInCategoryChannel ? 'category' : 'find'}|short`).setLabel('Edit short version').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(`editad_choice|${messageId}|${foundInCategoryChannel ? 'category' : 'find'}|full`).setLabel('Edit full detailed ad').setStyle(ButtonStyle.Secondary)
-          );
-
-          return interaction.reply({
-            content: 'Which version do you want to edit?',
-            components: [choiceRow],
-            ephemeral: true
-          }).catch(() => {});
-        }
-
-        if (adAction === 'delete') {
-          const messageId = interaction.options.getString('messageid', true);
-          const reason = interaction.options.getString('reason', false) || 'Ad removed by staff.';
-          await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-          let adData = db.createAds[messageId] || null;
-          let findMessageId = messageId;
-          let categoryMsgId = null;
-
-          if (!adData) {
-            for (const [msgId, data] of Object.entries(db.createAds || {})) {
-              if (data && data.categoryMessageId === messageId) {
-                adData = data;
-                findMessageId = msgId;
-                categoryMsgId = messageId;
-                break;
-              }
-            }
-          } else {
-            categoryMsgId = adData.categoryMessageId || null;
-          }
-
-          if (!adData) return interaction.editReply({ content: `No ad found with message ID \`${messageId}\` in the database.` }).catch(() => {});
-
-          const findChannel = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-          let findMsg = null;
-          if (findChannel) findMsg = await findChannel.messages.fetch(findMessageId).catch(() => null);
-
-          let categoryMsg = null;
-          if (adData.categoryChannelId && categoryMsgId) {
-            const categoryCh = await interaction.guild.channels.fetch(adData.categoryChannelId).catch(() => null);
-            if (categoryCh) categoryMsg = await categoryCh.messages.fetch(categoryMsgId).catch(() => null);
-          }
-
-          if (ARCHIVED_ADS_CHANNEL_ID) {
-            try {
-              const archiveCh = await interaction.guild.channels.fetch(ARCHIVED_ADS_CHANNEL_ID).catch(() => null);
-              if (archiveCh) {
-                const { embed: archiveEmbed, overflowMessages } = buildArchiveEmbed(adData, findMessageId, reason, interaction.user.id);
-                archiveEmbed.addFields({ name: 'Archived By', value: `<@${interaction.user.id}>` });
-                await archiveCh.send({ embeds: [archiveEmbed] }).catch(e => console.warn('deletead: archive post failed', e));
-                for (const message of overflowMessages) {
-                  await archiveCh.send({ content: message }).catch(e => console.warn('deletead: archive overflow post failed', e));
-                }
-              }
-            } catch (e) { console.warn('deletead: failed to post to archive channel', e); }
-          }
-
-          if (adData.tutorId) {
-            try {
-              const tutorUser = await client.users.fetch(adData.tutorId).catch(() => null);
-              if (tutorUser) {
-                const subject = adData.embed?.title || 'your subject';
-                await tutorUser.send(`Your ad for **${subject}** has been removed by staff.\nReason: ${reason}`).catch(() => {});
-              }
-            } catch (e) { console.warn('deletead: failed to DM tutor', e); }
-          }
-
-          const assignedStudents = getStudentsAssignedToTutor(adData.tutorId);
-          for (const studentId of assignedStudents) {
-            try {
-              const studentUser = await client.users.fetch(studentId).catch(() => null);
-              if (studentUser) {
-                const subject = adData.embed?.title || 'a subject';
-                await studentUser.send(`The ad for **${subject}** has been closed. If you need further assistance, please contact staff.`).catch(() => {});
-              }
-            } catch (e) { console.warn('deletead: failed to DM student', e); }
-          }
-
-          if (findMsg) await findMsg.delete().catch(e => console.warn('deletead: find-a-tutor delete failed', e));
-          if (categoryMsg) await categoryMsg.delete().catch(e => console.warn('deletead: category delete failed', e));
-
-          if (!db.archivedAds) db.archivedAds = {};
-          db.archivedAds[findMessageId] = { ...adData, archivedAt: Date.now(), archivedBy: interaction.user.id, reason };
-          delete db.createAds[findMessageId];
-          saveDB();
-
-          return interaction.editReply({ content: `Ad deleted and archived.${ARCHIVED_ADS_CHANNEL_ID ? ` Check <#${ARCHIVED_ADS_CHANNEL_ID}>.` : ''}` }).catch(() => {});
-        }
-
-        return interaction.reply({ content: 'Unknown ad action.', ephemeral: true }).catch(() => {});
-      }
-
 // CLOSE command changed: send an ephemeral message with select menus and a button to open modal for reason
 if (cmd === 'close') {
   const code = interaction.options.getString('code', true);
@@ -4664,7 +3044,7 @@ if (cmd === 'close') {
   return interaction.reply({ content: 'Please pick whether the student was hired, the tutor if yes, and the subject. Then click Provide reason and close.', components, ephemeral: true }).catch(() => {});
 }
 
-      // subject / tutor / createad / editad / sticky / embedcolor / editinit / help / staffhelp
+      // subject / tutor / sticky / embedcolor / editinit / help / staffhelp
       if (cmd === 'subject') {
         if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can manage subjects.', ephemeral: true }).catch(() => {});
         const action = interaction.options.getString('action', true);
@@ -4675,7 +3055,7 @@ if (cmd === 'close') {
           if (db.subjects.includes(subj)) return interaction.reply({ content: 'Subject already exists.', ephemeral: true }).catch(() => {});
           db.subjects.push(subj);
           if (levelRaw) {
-            const levelKey = normalizeCreateAdLevelKey(levelRaw) || detectLevelFromSubject(subj);
+            const levelKey = normalizeSubjectLevelKey(levelRaw) || detectLevelFromSubject(subj);
             if (levelKey) {
               if (!db.subjectLevels) db.subjectLevels = {};
               db.subjectLevels[subj] = levelKey;
@@ -4694,7 +3074,7 @@ if (cmd === 'close') {
         } else {
           if (!db.subjects || db.subjects.length === 0) return interaction.reply({ content: 'No subjects found.', ephemeral: true }).catch(() => {});
           const tutorAssignedFilter = interaction.options.getString('tutor-assigned', false); // 'yes', 'no', 'all', or null
-          const filterLevel = levelRaw ? (normalizeCreateAdLevelKey(levelRaw) || levelRaw) : null;
+          const filterLevel = levelRaw ? (normalizeSubjectLevelKey(levelRaw) || levelRaw) : null;
           let subjectsToList = db.subjects;
           if (filterLevel) {
             subjectsToList = subjectsToList.filter(s => {
@@ -4709,7 +3089,7 @@ if (cmd === 'close') {
           }
           // tutorAssignedFilter === 'all' or null: no filtering by assignment
           if (subjectsToList.length === 0) {
-            const filterDesc = [filterLevel ? `level: ${CREATEAD_LEVEL_LABELS[filterLevel] || filterLevel}` : null, tutorAssignedFilter === 'yes' ? 'has tutor' : tutorAssignedFilter === 'no' ? 'no tutor' : null].filter(Boolean).join(', ');
+            const filterDesc = [filterLevel ? `level: ${SUBJECT_LEVEL_LABELS[filterLevel] || filterLevel}` : null, tutorAssignedFilter === 'yes' ? 'has tutor' : tutorAssignedFilter === 'no' ? 'no tutor' : null].filter(Boolean).join(', ');
             return interaction.reply({ content: `No subjects found${filterDesc ? ` matching (${filterDesc})` : ''}.`, ephemeral: true }).catch(() => {});
           }
           const lines = subjectsToList.map(s => {
@@ -4717,7 +3097,7 @@ if (cmd === 'close') {
             const tutorCount = (db.subjectTutors[s] || []).length;
             return `${s} [${lvl}]${tutorCount ? ` (${tutorCount} tutor${tutorCount > 1 ? 's' : ''})` : ''}`;
           });
-          const filterDesc = [filterLevel ? `level: ${CREATEAD_LEVEL_LABELS[filterLevel] || filterLevel}` : null, tutorAssignedFilter === 'yes' ? 'has tutor' : tutorAssignedFilter === 'no' ? 'no tutor' : null].filter(Boolean).join(', ');
+          const filterDesc = [filterLevel ? `level: ${SUBJECT_LEVEL_LABELS[filterLevel] || filterLevel}` : null, tutorAssignedFilter === 'yes' ? 'has tutor' : tutorAssignedFilter === 'no' ? 'no tutor' : null].filter(Boolean).join(', ');
           const chunks = splitMessage(`Subjects (${lines.length})${filterDesc ? ` [${filterDesc}]` : ''}:\n${lines.join('\n')}`, 1900);
           await interaction.reply({ content: chunks[0] }).catch(() => {});
           for (let i = 1; i < chunks.length; i++) {
@@ -4743,7 +3123,7 @@ if (cmd === 'close') {
             // present a select of known tutors so staff don't need to type IDs
             const allTutorIds = getAllTutorIds();
             if (allTutorIds.length === 0) return interaction.reply({ content: 'No tutors in database.', ephemeral: true }).catch(() => {});
-            const options = await buildTutorSelectOptions(interaction.guild, allTutorIds, { includeAdCodes: true });
+            const options = await buildTutorSelectOptions(interaction.guild, allTutorIds);
             const select = buildPaginatedSelectMenu({ baseCustomId: 'tutor_select|info', placeholder: 'Select a tutor to view info', options });
             return interaction.reply({ content: 'Select a tutor to view info:', components: [new ActionRowBuilder().addComponents(select)], ephemeral: true }).catch(() => {});
           }
@@ -4753,8 +3133,6 @@ if (cmd === 'close') {
             const arr = db.subjectTutors[s] || [];
             if (arr.includes(userid)) subjects.push(s);
           }
-          // Find ad codes linked to this tutor
-          const adCodesList = Object.values(db.createAds || {}).filter(a => a.tutorId === userid && a.adCode).map(a => a.adCode);
           const profile = db.tutorProfiles[userid] || { addedAt: null, students: [], reviews: [], rating: { count: 0, avg: 0 } };
           const addedAt = profile && profile.addedAt ? `<t:${Math.floor(profile.addedAt/1000)}:f>` : '(unknown)';
           let userTag = '(not in guild)';
@@ -4781,7 +3159,6 @@ if (cmd === 'close') {
           const nameDisplay = displayName ? `**${displayName}** (<@${userid}> · \`${userTag}\`)` : `<@${userid}> · \`${userTag}\``;
           const lines = [
             `Tutor info for: ${nameDisplay} — ID: \`${userid}\``,
-            `Ad code(s): ${adCodesList.length ? adCodesList.join(', ') : '(none)'}`,
             `Guild joined: ${joined}`,
             `Tutor added at: ${addedAt}`,
             `Subjects: ${subjects.length ? subjects.join(', ') : '(none)'}`,
@@ -5129,234 +3506,6 @@ if (cmd === 'close') {
         return;
       }
 
-
-if (cmd === 'createad') {
-    if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can create ads.', ephemeral: true }).catch(() => {});
-
-    // Acknowledge and fetch usernames into DB (may take time). We reply first to avoid "application did not respond".
-    try {
-      await interaction.reply({ content: 'Preparing ad modal and resolving tutor usernames, please wait...', ephemeral: true });
-    } catch (e) { /* ignore */ }
-
-    const allTutorIds = Array.from(new Set(Object.values(db.subjectTutors || {}).flat()));
-    // For each tutor id, if we don't have a username stored, try to fetch the guild member or user and save it.
-    const fetchPromises = allTutorIds.map(async (tid) => {
-      try {
-        if (!tid) return;
-        db.tutorProfiles = db.tutorProfiles || {};
-        db.tutorProfiles[tid] = db.tutorProfiles[tid] || { addedAt: null, students: [], reviews: [], rating: { count: 0, avg: 0 }, notes: '' };
-        if (db.tutorProfiles[tid].username) return; // already known
-        // Try guild member fetch (may take time) — this is OK because we've already replied.
-        const member = await interaction.guild.members.fetch(tid).catch(() => null);
-        if (member && member.user) {
-          db.tutorProfiles[tid].username = member.user.username;
-          db.tutorProfiles[tid].tag = member.user.tag;
-          return;
-        }
-        const user = await client.users.fetch(tid).catch(() => null);
-        if (user) {
-          db.tutorProfiles[tid].username = user.username;
-          db.tutorProfiles[tid].tag = user.tag;
-        }
-      } catch (e) { /* ignore per-user failures */ }
-    });
-
-    try {
-      await Promise.allSettled(fetchPromises);
-      saveDB();
-    } catch (e) { /* ignore */ }
-
-    // Now send a follow-up that asks for category first (University/A level/IGCSE/etc),
-    // then enables opening the modal. We do this outside the modal to avoid Discord's 5-row modal limit.
-    const levelOptions = [
-      new StringSelectMenuOptionBuilder().setLabel('University').setValue('university'),
-      new StringSelectMenuOptionBuilder().setLabel('A level').setValue('a_level'),
-      new StringSelectMenuOptionBuilder().setLabel('IGCSE').setValue('igcse'),
-      new StringSelectMenuOptionBuilder().setLabel('Below IGCSE').setValue('below_igcse'),
-      new StringSelectMenuOptionBuilder().setLabel('Language').setValue('language'),
-      new StringSelectMenuOptionBuilder().setLabel('Test Prep').setValue('test_prep'),
-      new StringSelectMenuOptionBuilder().setLabel('Other').setValue('other')
-    ];
-    const levelSelect = new StringSelectMenuBuilder()
-      .setCustomId(`createad_level|${interaction.user.id}`)
-      .setPlaceholder('Select subject level category')
-      .addOptions(levelOptions)
-      .setRequired(true);
-
-    await interaction.followUp({
-      content: 'Ready — select the subject level category, then choose a subject to open the ad modal.',
-      components: [new ActionRowBuilder().addComponents(levelSelect)],
-      ephemeral: true
-    }).catch(() => {});
-    return;
-}
-
-      // editad command prefill modal
-      if (cmd === 'editad') {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can edit ads.', ephemeral: true }).catch(() => {});
-        const messageId = interaction.options.getString('messageid', true);
-        
-        // First, check if this is a category channel message ID
-        let adData = null;
-        let foundInFindChannel = false;
-        let foundInCategoryChannel = false;
-        
-        // Check find-a-tutor channel
-        const findChannel = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-        let msg = null;
-        if (findChannel) {
-          msg = await findChannel.messages.fetch(messageId).catch(() => null);
-          if (msg) {
-            foundInFindChannel = true;
-            adData = db.createAds[messageId];
-          }
-        }
-        
-        // If not found in find channel, search category channels using stored ad data
-        if (!msg) {
-          // Find the ad entry whose categoryMessageId matches the provided messageId
-          let matchedAdData = null;
-          for (const [msgId, data] of Object.entries(db.createAds || {})) {
-            if (data.categoryMessageId === messageId) {
-              matchedAdData = data;
-              break;
-            }
-          }
-
-          if (matchedAdData && matchedAdData.categoryChannelId) {
-            const categoryCh = await interaction.guild.channels.fetch(matchedAdData.categoryChannelId).catch(() => null);
-            if (categoryCh) {
-              const categoryMsg = await categoryCh.messages.fetch(messageId).catch(() => null);
-              if (categoryMsg) {
-                msg = categoryMsg;
-                foundInCategoryChannel = true;
-                adData = matchedAdData;
-              }
-            }
-          }
-        }
-        
-        if (!msg) return interaction.reply({ content: `Message ${messageId} not found in find-a-tutor or any category channel.`, ephemeral: true }).catch(() => {});
-
-        const embed = msg.embeds && msg.embeds.length ? msg.embeds[0] : null;
-        const preTitle = embed?.title || '';
-        const preDesc = embed?.description || '';
-        const preColor = adData?.embed?.color || null;
-        
-        // Extract role mention from message content if exists
-        let preRoleId = '';
-        if (msg.content) {
-            const roleMatch = msg.content.match(/<@&(\d+)>/);
-            if (roleMatch) {
-                preRoleId = roleMatch[1];
-            }
-        }
-
-        if ((db.subjects || []).length === 0) {
-            return interaction.reply({ content: 'No subjects available. Please add subjects first using /subject add', ephemeral: true }).catch(() => {});
-        }
-
-        const choiceRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId(`editad_choice|${messageId}|${foundInCategoryChannel ? 'category' : 'find'}|short`).setLabel('Edit short version').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId(`editad_choice|${messageId}|${foundInCategoryChannel ? 'category' : 'find'}|full`).setLabel('Edit full detailed ad').setStyle(ButtonStyle.Secondary)
-        );
-
-        return interaction.reply({
-          content: 'Which version do you want to edit?',
-          components: [choiceRow],
-          ephemeral: true
-        }).catch(() => {});
-      }
-
-      // deletead command — archive and remove an ad
-      if (cmd === 'deletead') {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can delete ads.', ephemeral: true }).catch(() => {});
-        const messageId = interaction.options.getString('messageid', true);
-        const reason = interaction.options.getString('reason', false) || 'Ad removed by staff.';
-        await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-        // Find the ad in database (could be find-a-tutor messageId or category messageId)
-        let adData = db.createAds[messageId] || null;
-        let findMessageId = messageId;
-        let categoryMsgId = null;
-
-        if (!adData) {
-          for (const [msgId, data] of Object.entries(db.createAds || {})) {
-            if (data && data.categoryMessageId === messageId) {
-              adData = data;
-              findMessageId = msgId;
-              categoryMsgId = messageId;
-              break;
-            }
-          }
-        } else {
-          categoryMsgId = adData.categoryMessageId || null;
-        }
-
-        if (!adData) return interaction.editReply({ content: `No ad found with message ID \`${messageId}\` in the database.` }).catch(() => {});
-
-        // Fetch the find-a-tutor message
-        const findChannel = await interaction.guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-        let findMsg = null;
-        if (findChannel) findMsg = await findChannel.messages.fetch(findMessageId).catch(() => null);
-
-        // Fetch category channel message
-        let categoryMsg = null;
-        if (adData.categoryChannelId && categoryMsgId) {
-          const categoryCh = await interaction.guild.channels.fetch(adData.categoryChannelId).catch(() => null);
-          if (categoryCh) categoryMsg = await categoryCh.messages.fetch(categoryMsgId).catch(() => null);
-        }
-
-        // Post archived version to archived ads channel (staff-only)
-        if (ARCHIVED_ADS_CHANNEL_ID) {
-          try {
-            const archiveCh = await interaction.guild.channels.fetch(ARCHIVED_ADS_CHANNEL_ID).catch(() => null);
-            if (archiveCh) {
-              const { embed: archiveEmbed, overflowMessages } = buildArchiveEmbed(adData, findMessageId, reason, interaction.user.id);
-              archiveEmbed.addFields({ name: 'Archived By', value: `<@${interaction.user.id}>` });
-              await archiveCh.send({ embeds: [archiveEmbed] }).catch(e => console.warn('deletead: archive post failed', e));
-              for (const message of overflowMessages) {
-                await archiveCh.send({ content: message }).catch(e => console.warn('deletead: archive overflow post failed', e));
-              }
-            }
-          } catch (e) { console.warn('deletead: failed to post to archive channel', e); }
-        }
-
-        // Notify assigned tutor via DM
-        if (adData.tutorId) {
-          try {
-            const tutorUser = await client.users.fetch(adData.tutorId).catch(() => null);
-            if (tutorUser) {
-              const subject = adData.embed?.title || 'your subject';
-              await tutorUser.send(`Your ad for **${subject}** has been removed by staff.\nReason: ${reason}`).catch(() => {});
-            }
-          } catch (e) { console.warn('deletead: failed to DM tutor', e); }
-        }
-
-        // Notify assigned students via DM
-        const assignedStudents = getStudentsAssignedToTutor(adData.tutorId);
-        for (const studentId of assignedStudents) {
-          try {
-            const studentUser = await client.users.fetch(studentId).catch(() => null);
-            if (studentUser) {
-              const subject = adData.embed?.title || 'a subject';
-              await studentUser.send(`The ad for **${subject}** has been closed. If you need further assistance, please contact staff.`).catch(() => {});
-            }
-          } catch (e) { console.warn('deletead: failed to DM student', e); }
-        }
-
-        // Delete messages from Discord channels
-        if (findMsg) await findMsg.delete().catch(e => console.warn('deletead: find-a-tutor delete failed', e));
-        if (categoryMsg) await categoryMsg.delete().catch(e => console.warn('deletead: category delete failed', e));
-
-        // Archive in DB and remove from active ads
-        if (!db.archivedAds) db.archivedAds = {};
-        db.archivedAds[findMessageId] = { ...adData, archivedAt: Date.now(), archivedBy: interaction.user.id, reason };
-        delete db.createAds[findMessageId];
-        saveDB();
-
-        return interaction.editReply({ content: `Ad deleted and archived.${ARCHIVED_ADS_CHANNEL_ID ? ` Check <#${ARCHIVED_ADS_CHANNEL_ID}>.` : ''}` }).catch(() => {});
-      }
 
       // sticky command shows modal (prefill)
       if (cmd === 'sticky') {
@@ -5744,102 +3893,6 @@ if (cmd === 'createad') {
         return;
       }
 
-      if (cmd === 'migrateads') {
-        if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can run ad migration.', ephemeral: true }).catch(() => {});
-        const force = interaction.options.getBoolean('force') || false;
-
-        const MIGRATE_RATE_LIMIT_DELAY_MS = 1000;
-
-        await interaction.deferReply({ ephemeral: true }).catch(() => {});
-
-        // Ensure all guild channels are in the cache so findSubjectChannel can
-        // locate category and subject channels by name.
-        await interaction.guild.channels.fetch().catch(() => {});
-
-        const allAds = Object.entries(db.createAds || {});
-        const toMigrate = force
-          ? allAds
-          : allAds.filter(([, data]) => !data.categoryMessageId);
-
-        if (toMigrate.length === 0) {
-          return interaction.editReply({ content: force ? 'No ads found in the database.' : 'All ads already have a category message. Use `force:true` to re-post.' }).catch(() => {});
-        }
-
-        await interaction.editReply({ content: `Migrating ${toMigrate.length} ad(s)… please wait.` });
-
-        let migrated = 0;
-        let skipped = 0;
-        const errors = [];
-
-        for (const [messageId, adData] of toMigrate) {
-          try {
-            const subject = adData.embed && adData.embed.title ? adData.embed.title : null;
-            // Fall back to auto-detecting the level from the subject name so that
-            // ads created before the level field was introduced still get routed
-            // to the correct category (e.g. "IGCSE Maths" → igcse, not "other").
-            const levelKey = adData.level || detectLevelFromSubject(subject) || 'other';
-
-            if (!subject) { skipped++; continue; }
-
-            const categoryCh = await findSubjectChannel(interaction.guild, levelKey, subject).catch(() => null);
-            if (!categoryCh) {
-              if (process.env.DEBUG_MIGRATEADS) console.debug(`[migrateads] skip ${messageId}: no channel for subject="${subject}" level="${levelKey}"`);
-              skipped++;
-              continue;
-            }
-
-            // Build structured embed description from fullDetails
-            const details = adData.fullDetails || {};
-            const adCode = adData.adCode || null;
-            let migrateDesc = '';
-            if (adCode) migrateDesc += `**Tutor Code:** ${adCode}\n`;
-            if (details.subjectCodes) migrateDesc += `**Subject Codes:** ${details.subjectCodes}\n`;
-            if (details.languages) migrateDesc += `**Languages:** ${details.languages}\n`;
-            if (details.price && details.price1on1) {
-              migrateDesc += `**Price (Group):** $${details.price}\n`;
-              migrateDesc += `**Price (1-on-1):** $${details.price1on1}\n`;
-            } else if (details.price) {
-              migrateDesc += `**Price:** $${details.price}\n`;
-            } else if (details.price1on1) {
-              migrateDesc += `**Price (1-on-1):** $${details.price1on1}\n`;
-            }
-            migrateDesc += `\nClick **View Full Details** below for more information.\n`;
-            migrateDesc += `📩 DM <@${client.user.id}> when you're ready to pay!`;
-
-            const migrateEmbed = new EmbedBuilder().setTitle(subject).setDescription(migrateDesc);
-            if (adData.embed && adData.embed.color) {
-              try { migrateEmbed.setColor(adData.embed.color); } catch (e) {}
-            }
-
-            const migrateRow = new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(`view_full_details|${adData.adCode || subject}`).setLabel('View Full Details').setStyle(ButtonStyle.Secondary),
-              new ButtonBuilder().setCustomId(`ad_enquire|${subject}`).setLabel('Talk to Tutors!').setStyle(ButtonStyle.Success)
-            );
-
-            // Do NOT ping tutors — tutor identities are kept secret
-            const sent = await categoryCh.send({ embeds: [migrateEmbed], components: [migrateRow] }).catch(() => null);
-            if (sent) {
-              db.createAds[messageId].categoryChannelId = categoryCh.id;
-              db.createAds[messageId].categoryMessageId = sent.id;
-              saveDB();
-              migrated++;
-            } else {
-              skipped++;
-            }
-
-            // Small delay to respect Discord rate limits
-            await new Promise(resolve => setTimeout(resolve, MIGRATE_RATE_LIMIT_DELAY_MS));
-          } catch (e) {
-            console.warn('migrateads: error migrating ad', messageId, e);
-            errors.push(messageId);
-          }
-        }
-
-        const summary = [`Migration complete!`, `✅ Migrated: ${migrated}`, `⏭️ Skipped: ${skipped}`];
-        if (errors.length > 0) summary.push(`❌ Errors: ${errors.length} (check logs)`);
-        return interaction.editReply({ content: summary.join('\n') }).catch(() => {});
-      }
-
       if (cmd === 'modmailmap') {
         if (!isStaff(interaction.member)) return interaction.reply({ content: 'Only staff can configure modmail mappings.', ephemeral: true }).catch(() => {});
         const purpose = interaction.options.getString('purpose', true);
@@ -6180,115 +4233,9 @@ client.on('messageCreate', async (message) => {
       }
     }
 
-    // Ads channel sync
-    if (ADS_CHANNEL_ID && SYNC_WEBHOOK_URL && String(message.channel?.id) === String(ADS_CHANNEL_ID)) {
-      try {
-        await fetch(SYNC_WEBHOOK_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-TL-Sync-Secret': SYNC_SECRET || '' },
-          body: JSON.stringify({ event: 'messageCreate', messageId: message.id, channelId: message.channel.id, authorId: message.author?.id, content: message.content, embeds: message.embeds.map(e => e.toJSON()), attachments: [...message.attachments.values()].map(a => ({ id: a.id, url: a.url, name: a.name, size: a.size })) })
-        });
-      } catch (e) { console.warn('ads sync messageCreate failed', e); }
-    }
   } catch (e) {
     console.warn('messageCreate handler error', e);
     try { await notifyStaffError(e, 'messageCreate handler', message); } catch (err) { console.warn('notifyStaffError failed', err); }
-  }
-});
-
-// messageUpdate handler — sync edits in ADS_CHANNEL_ID
-client.on('messageUpdate', async (oldMessage, newMessage) => {
-  if (!ADS_CHANNEL_ID || !SYNC_WEBHOOK_URL) return;
-  if (String(newMessage.channel?.id) !== String(ADS_CHANNEL_ID)) return;
-  try {
-    await fetch(SYNC_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TL-Sync-Secret': SYNC_SECRET || '' },
-      body: JSON.stringify({ event: 'messageUpdate', messageId: newMessage.id, channelId: newMessage.channel.id, authorId: newMessage.author?.id, content: newMessage.content, embeds: (newMessage.embeds || []).map(e => e.toJSON()), attachments: [...(newMessage.attachments?.values() || [])].map(a => ({ id: a.id, url: a.url, name: a.name, size: a.size })) })
-    });
-  } catch (e) { console.warn('ads sync messageUpdate failed', e); }
-});
-
-// messageDelete handler — sync deletions in ADS_CHANNEL_ID
-client.on('messageDelete', async (message) => {
-  if (!ADS_CHANNEL_ID || !SYNC_WEBHOOK_URL) return;
-  if (String(message.channel?.id) !== String(ADS_CHANNEL_ID)) return;
-  try {
-    await fetch(SYNC_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-TL-Sync-Secret': SYNC_SECRET || '' },
-      body: JSON.stringify({ event: 'messageDelete', messageId: message.id, channelId: message.channel.id })
-    });
-  } catch (e) { console.warn('ads sync messageDelete failed', e); }
-});
-
-// guildMemberRemove: auto-archive active ads when a tutor leaves the guild
-client.on('guildMemberRemove', async (member) => {
-  try {
-    if (String(member.guild.id) !== String(GUILD_ID)) return;
-    const userId = member.id;
-
-    // Find all active ads linked to this tutor
-    const tutorAds = Object.entries(db.createAds || {}).filter(([, data]) => data && String(data.tutorId) === String(userId));
-    if (!tutorAds.length) return;
-
-    const guild = member.guild;
-    const reason = 'Tutor left the server.';
-
-    for (const [msgId, adData] of tutorAds) {
-      try {
-        // Post archived version to staff archive channel
-        if (ARCHIVED_ADS_CHANNEL_ID) {
-          const archiveCh = await guild.channels.fetch(ARCHIVED_ADS_CHANNEL_ID).catch(() => null);
-          if (archiveCh) {
-            const { embed: archiveEmbed, overflowMessages } = buildArchiveEmbed(adData, msgId, reason, 'system');
-            await archiveCh.send({ embeds: [archiveEmbed] }).catch(e => console.warn('guildMemberRemove: archive post failed', e));
-            for (const message of overflowMessages) {
-              await archiveCh.send({ content: message }).catch(e => console.warn('guildMemberRemove: archive overflow post failed', e));
-            }
-          }
-        }
-
-        // Notify assigned students via DM
-        const assignedStudents = getStudentsAssignedToTutor(userId);
-        for (const studentId of assignedStudents) {
-          try {
-            const studentUser = await client.users.fetch(studentId).catch(() => null);
-            if (studentUser) {
-              const subject = adData.embed?.title || 'a subject';
-              await studentUser.send(`The tutor for **${subject}** has left the server. If you need further assistance, please contact staff.`).catch(() => {});
-            }
-          } catch (e) { console.warn('guildMemberRemove: failed to DM student', e); }
-        }
-
-        // Delete the ad message from find-a-tutor channel
-        const findChannel = await guild.channels.fetch(FIND_A_TUTOR_CHANNEL_ID).catch(() => null);
-        if (findChannel) {
-          const findMsg = await findChannel.messages.fetch(msgId).catch(() => null);
-          if (findMsg) await findMsg.delete().catch(e => console.warn('guildMemberRemove: find-a-tutor delete failed', e));
-        }
-
-        // Delete category channel copy
-        if (adData.categoryChannelId && adData.categoryMessageId) {
-          const categoryCh = await guild.channels.fetch(adData.categoryChannelId).catch(() => null);
-          if (categoryCh) {
-            const categoryMsg = await categoryCh.messages.fetch(adData.categoryMessageId).catch(() => null);
-            if (categoryMsg) await categoryMsg.delete().catch(e => console.warn('guildMemberRemove: category delete failed', e));
-          }
-        }
-
-        // Move from createAds to archivedAds
-        if (!db.archivedAds) db.archivedAds = {};
-        db.archivedAds[msgId] = { ...adData, archivedAt: Date.now(), archivedBy: 'system', reason };
-        delete db.createAds[msgId];
-        saveDB();
-      } catch (e) {
-        console.warn(`guildMemberRemove: error archiving ad ${msgId} for tutor ${userId}`, e);
-        try { notifyStaffError(e, 'guildMemberRemove archiveAd'); } catch (err) {}
-      }
-    }
-  } catch (e) {
-    console.warn('guildMemberRemove handler error', e);
   }
 });
 
