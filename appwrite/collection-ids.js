@@ -53,10 +53,8 @@ export const BOT_COLLECTION_IDS = COLLECTION_IDS;
 
 // Website database collection IDs (read-only, used by appwrite-website-reader.js)
 export const WEBSITE_COLLECTION_IDS = {
-  subjects:       'discordSubjects',
-  subjectLevels:  'discordSubjectLevels',
-  subjectTutors:  'discordSubjectTutors',
-  tutorProfiles:  'discordTutorProfiles',
-  createAds:      'discordCreateAds',
-  ads:            'ads',
+  tutorProfiles:     'tutor_profiles',
+  tutor_reviews:     'tutor_reviews',
+  subjects:          'subjects',           // may be empty — handled gracefully
+  subjectCategories: 'subject_categories',
 };

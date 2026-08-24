@@ -46,12 +46,8 @@ function getDB() {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level helpers (read-only)
+// Low-level helper (read-only, paginated)
 // ---------------------------------------------------------------------------
-
-function safeJSON(str, fallback = null) {
-  try { return JSON.parse(str); } catch { return fallback; }
-}
 
 async function listAllDocs(collectionId, queries = []) {
   const db = getDB();
@@ -76,31 +72,17 @@ async function listAllDocs(collectionId, queries = []) {
   }
 }
 
-async function getSingleDoc(collectionId, documentId) {
-  const db = getDB();
-  if (!db) return null;
-  try {
-    return await db.getDocument(DB_ID, collectionId, documentId);
-  } catch (e) {
-    if (e instanceof AppwriteException && e.code === 404) return null;
-    console.warn(`[WebsiteDB] getDocument failed (${collectionId}/${documentId}): ${e.message}`);
-    return null;
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Context loader
 // ---------------------------------------------------------------------------
 
 /**
- * Load all tutor/subject/pricing data from the website database.
+ * Load all tutor/subject data from the website database.
  *
- * Returns an object with:
- *   subjects       — array of subject name strings (or objects with {name, level})
- *   subjectLevels  — map subjectName → levelKey
- *   subjectTutors  — map subjectName → [tutorId, ...]
- *   tutorProfiles  — map tutorId → profile object
- *   ads            — array of ad objects with pricing/details
+ * Returns:
+ *   tutors   — array of active tutor profile objects (mapped from real schema)
+ *   reviews  — map of tutorId → { avg: number, snippets: string[] }
+ *   subjects — array of unique subject name strings
  *
  * Returns null if the website DB is not configured.
  */
@@ -108,66 +90,76 @@ export async function loadTutorContext() {
   if (!isWebsiteConfigured()) return null;
 
   try {
-    const [subjectDocs, subjectLevelDocs, subjectTutorDocs, tutorProfileDocs, adDocs] = await Promise.all([
+    // Fetch tutor_profiles (active only), tutor_reviews, and optionally subjects
+    const [tutorProfileDocs, reviewDocs, subjectDocs] = await Promise.all([
+      listAllDocs(WEBSITE_COLLECTION_IDS.tutorProfiles, [Query.equal('active', true)]),
+      listAllDocs(WEBSITE_COLLECTION_IDS.tutor_reviews, [
+        Query.equal('isPublic', true),
+        Query.equal('isDeleted', false),
+      ]),
       listAllDocs(WEBSITE_COLLECTION_IDS.subjects),
-      listAllDocs(WEBSITE_COLLECTION_IDS.subjectLevels),
-      listAllDocs(WEBSITE_COLLECTION_IDS.subjectTutors),
-      listAllDocs(WEBSITE_COLLECTION_IDS.tutorProfiles),
-      listAllDocs(WEBSITE_COLLECTION_IDS.ads),
     ]);
 
-    // Subjects: may be a single-doc collection storing JSON or individual docs
-    let subjects = [];
-    if (subjectDocs.length === 1 && subjectDocs[0].$id === 'all') {
-      subjects = safeJSON(subjectDocs[0].data, []);
-    } else {
-      subjects = subjectDocs.map(d => safeJSON(d.data) ?? d.name ?? d.$id).filter(Boolean);
+    // --- Map tutor profiles directly from real schema fields ---
+    const tutors = tutorProfileDocs.map(doc => ({
+      id:           doc.$id,
+      displayName:  doc.displayName  || '',
+      slug:         doc.slug         || '',
+      headline:     doc.headline     || '',
+      shortBio:     doc.shortBio     || '',
+      subjects:     Array.isArray(doc.subjects)  ? doc.subjects  : [],
+      levels:       Array.isArray(doc.levels)    ? doc.levels    : [],
+      languages:    Array.isArray(doc.languages) ? doc.languages : [],
+      hourlyRate:   doc.hourlyRate   ?? null,
+      availability: doc.availability || '',
+      responseTime: doc.responseTime || '',
+      rating:       typeof doc.rating      === 'number' ? doc.rating      : null,
+      reviewCount:  typeof doc.reviewCount === 'number' ? doc.reviewCount : 0,
+      verified:     doc.verified  === true,
+      featured:     doc.featured  === true,
+    }));
+
+    // --- Aggregate reviews by tutorId ---
+    const reviewMap = {};
+    for (const doc of reviewDocs) {
+      const tid = doc.tutorId;
+      if (!tid) continue;
+      if (!reviewMap[tid]) reviewMap[tid] = { ratings: [], snippets: [] };
+      if (typeof doc.rating === 'number') reviewMap[tid].ratings.push(doc.rating);
+      if (doc.body && typeof doc.body === 'string') {
+        // Keep up to 3 recent snippets (trimmed to 120 chars each)
+        if (reviewMap[tid].snippets.length < 3) {
+          reviewMap[tid].snippets.push(doc.body.trim().slice(0, 120));
+        }
+      }
+    }
+    const reviews = {};
+    for (const [tid, data] of Object.entries(reviewMap)) {
+      const avg = data.ratings.length
+        ? Math.round((data.ratings.reduce((s, r) => s + r, 0) / data.ratings.length) * 10) / 10
+        : null;
+      reviews[tid] = { avg, snippets: data.snippets };
     }
 
-    // SubjectLevels
-    let subjectLevels = {};
-    if (subjectLevelDocs.length === 1 && subjectLevelDocs[0].$id === 'all') {
-      subjectLevels = safeJSON(subjectLevelDocs[0].data, {});
-    } else {
-      for (const doc of subjectLevelDocs) {
-        const val = safeJSON(doc.data);
-        if (val && typeof val === 'object') Object.assign(subjectLevels, val);
+    // --- Build subjects list ---
+    // Prefer the subjects collection; fall back to deriving from tutor profiles.
+    let subjects = subjectDocs
+      .map(d => d.name || d.title || d.$id)
+      .filter(Boolean);
+
+    if (subjects.length === 0) {
+      // Derive unique subjects from all active tutor profiles
+      const seen = new Set();
+      for (const tutor of tutors) {
+        for (const s of tutor.subjects) {
+          if (s && !seen.has(s)) { seen.add(s); subjects.push(s); }
+        }
       }
     }
 
-    // SubjectTutors
-    let subjectTutors = {};
-    if (subjectTutorDocs.length === 1 && subjectTutorDocs[0].$id === 'all') {
-      subjectTutors = safeJSON(subjectTutorDocs[0].data, {});
-    } else {
-      for (const doc of subjectTutorDocs) {
-        const val = safeJSON(doc.data);
-        if (val !== null) subjectTutors[doc.$id] = val;
-      }
-    }
+    console.log(`[Alvey] Context refreshed (WebsiteDB) - ${tutors.length} tutors, ${subjects.length} subjects.`);
 
-    // TutorProfiles
-    const tutorProfiles = {};
-    for (const doc of tutorProfileDocs) {
-      const val = safeJSON(doc.data) ?? doc;
-      if (val) tutorProfiles[doc.$id] = val;
-    }
-
-    // Ads (pricing info)
-    const ads = adDocs.map(doc => {
-      const source = safeJSON(doc.Source || doc.source || null);
-      return {
-        id: doc.$id,
-        title: doc.title || '',
-        description: doc.description || doc.body || '',
-        tutorId: doc.createdBy || doc.tutorId || (source?.ad?.tutorId) || null,
-        adCode: doc.adCode || (source?.ad?.adCode) || null,
-        fullDetails: source?.ad?.fullDetails || null,
-        status: doc.status || 'active',
-      };
-    }).filter(a => a.status === 'active');
-
-    return { subjects, subjectLevels, subjectTutors, tutorProfiles, ads };
+    return { tutors, reviews, subjects };
   } catch (e) {
     console.warn('[WebsiteDB] loadTutorContext failed:', e.message);
     return null;

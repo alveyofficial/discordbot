@@ -25,85 +25,63 @@ function appendHistory(userId, role, content) {
   while (history.length > HISTORY_LIMIT) history.shift();
 }
 
-function safeArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-function formatTutorName(tutorId, profile = {}) {
-  return profile.displayName || profile.name || profile.username || profile.tag || `Tutor ${String(tutorId).slice(-4)}`;
-}
-
-function extractAdPrice(ad = {}) {
-  const details = ad.fullDetails || {};
-  const parts = [];
-  if (details.price) parts.push(`group $${details.price}`);
-  if (details.price1on1) parts.push(`1-on-1 $${details.price1on1}`);
-  if (details.classDuration) parts.push(details.classDuration);
-  if (details.timezone) parts.push(`timezone ${details.timezone}`);
-  return parts.join(', ');
-}
-
-function buildContextSnapshot(rawContext, fallbackDb) {
-  const context = rawContext || {
-    subjects: fallbackDb.subjects || [],
-    subjectLevels: fallbackDb.subjectLevels || {},
-    subjectTutors: fallbackDb.subjectTutors || {},
-    tutorProfiles: fallbackDb.tutorProfiles || {},
-    ads: Object.entries(fallbackDb.createAds || {}).map(([id, ad]) => ({ id, ...ad, fullDetails: ad.fullDetails || null, tutorId: ad.tutorId || null }))
-  };
-
-  const subjects = safeArray(context.subjects).map(subject => {
-    if (typeof subject === 'string') return subject;
-    return subject?.name || subject?.title || subject?.subject || '';
-  }).filter(Boolean);
-  const subjectLevels = context.subjectLevels || {};
-  const subjectTutors = context.subjectTutors || {};
-  const tutorProfiles = context.tutorProfiles || {};
-  const ads = safeArray(context.ads);
-
-  const subjectsByLevel = new Map();
-  for (const subject of subjects) {
-    const level = subjectLevels[subject] || 'other';
-    if (!subjectsByLevel.has(level)) subjectsByLevel.set(level, []);
-    subjectsByLevel.get(level).push(subject);
-  }
+function buildContextSnapshot(rawContext) {
+  // rawContext shape: { tutors: [...], reviews: { [tutorId]: { avg, snippets } }, subjects: [...] }
+  // Falls back to empty state if null (website DB not configured or fetch failed).
+  const tutors   = rawContext?.tutors   ?? [];
+  const reviews  = rawContext?.reviews  ?? {};
+  const subjects = rawContext?.subjects ?? [];
 
   const lines = [];
-  lines.push('Available subjects by level:');
-  for (const [level, names] of [...subjectsByLevel.entries()].sort()) {
-    lines.push(`- ${level}: ${names.slice(0, 60).join(', ')}`);
-  }
 
+  // --- Subject list ---
+  lines.push(`Available subjects: ${subjects.length ? subjects.join(', ') : '(none on record)'}`);
   lines.push('');
-  lines.push('Tutors and pricing:');
-  const tutorSubjectMap = new Map();
-  for (const [subject, tutorIds] of Object.entries(subjectTutors)) {
-    for (const tutorId of safeArray(tutorIds)) {
-      const id = String(tutorId);
-      if (!tutorSubjectMap.has(id)) tutorSubjectMap.set(id, []);
-      tutorSubjectMap.get(id).push(subject);
+
+  // --- Tutor list (up to 80 entries to stay within the 18 000-char cap) ---
+  lines.push('Tutors:');
+  for (const t of tutors.slice(0, 80)) {
+    const parts = [];
+
+    parts.push(t.displayName || `Tutor ${t.id.slice(-4)}`);
+
+    if (t.subjects.length)    parts.push(`Subjects: ${t.subjects.join(', ')}`);
+    if (t.levels.length)      parts.push(`Levels: ${t.levels.join(', ')}`);
+    if (t.languages.length)   parts.push(`Languages: ${t.languages.join(', ')}`);
+    if (t.hourlyRate != null) parts.push(`Rate: $${t.hourlyRate}/hr`);
+    if (t.availability)       parts.push(`Availability: ${t.availability}`);
+    if (t.responseTime)       parts.push(`Response: ${t.responseTime}`);
+
+    // Prefer live review aggregate over stored rating field
+    const rev = reviews[t.id];
+    const ratingAvg  = rev?.avg    ?? t.rating;
+    const ratingCount = rev        ? rev.snippets.length   // rough proxy when count not in reviews
+                                   : t.reviewCount;
+    if (ratingAvg != null) {
+      parts.push(`Rating: ${ratingAvg}/5${ratingCount ? ` (${t.reviewCount || ratingCount} reviews)` : ''}`);
     }
-  }
-  for (const [tutorId, tutorSubjects] of [...tutorSubjectMap.entries()].slice(0, 80)) {
-    const profile = tutorProfiles[tutorId] || {};
-    const rating = profile.rating?.avg ? `, rating ${profile.rating.avg}/5 (${profile.rating.count || 0})` : '';
-    const tutorAds = ads.filter(ad => String(ad.tutorId || ad.createdBy || '') === tutorId);
-    const pricing = tutorAds.map(extractAdPrice).filter(Boolean).slice(0, 3).join('; ');
-    lines.push(`- ${formatTutorName(tutorId, profile)} (${tutorId}): ${tutorSubjects.slice(0, 12).join(', ')}${rating}${pricing ? `. Pricing: ${pricing}` : ''}`);
+
+    if (t.verified) parts.push('Verified');
+    if (t.featured) parts.push('Featured');
+
+    lines.push(`- ${parts.join(' | ')}`);
+
+    // Append up to 2 review snippets as flavour text, indented
+    if (rev?.snippets?.length) {
+      for (const snippet of rev.snippets.slice(0, 2)) {
+        lines.push(`  "${snippet}"`);
+      }
+    }
   }
 
-  if (!tutorSubjectMap.size && ads.length) {
-    for (const ad of ads.slice(0, 60)) {
-      const subject = ad.embed?.title || ad.title || ad.subject || 'Tutor ad';
-      const pricing = extractAdPrice(ad);
-      lines.push(`- ${subject}${ad.tutorId ? ` tutorId ${ad.tutorId}` : ''}${pricing ? `. Pricing: ${pricing}` : ''}`);
-    }
+  if (!tutors.length) {
+    lines.push('(No active tutors on record.)');
   }
 
   return {
     text: lines.join('\n').slice(0, 18000),
-    tutorCount: tutorSubjectMap.size || new Set(ads.map(ad => ad.tutorId).filter(Boolean)).size,
-    subjectCount: subjects.length
+    tutorCount: tutors.length,
+    subjectCount: subjects.length,
   };
 }
 
@@ -153,12 +131,12 @@ export default function initAIAssistant({ client, db, saveDB, createEnquiryTicke
   async function refreshContext() {
     try {
       const raw = isWebsiteConfigured() ? await loadTutorContext() : null;
-      cachedContext = buildContextSnapshot(raw, db);
-      const source = raw ? 'WebsiteDB' : 'BotDB fallback';
+      cachedContext = buildContextSnapshot(raw);
+      const source = raw ? 'WebsiteDB' : 'none';
       console.log(`[Alvey] Context refreshed (${source}) - ${cachedContext.tutorCount} tutors, ${cachedContext.subjectCount} subjects.`);
     } catch (err) {
       console.warn('[Alvey] Context refresh failed:', err.message);
-      cachedContext = buildContextSnapshot(null, db);
+      cachedContext = buildContextSnapshot(null);
     }
   }
 
